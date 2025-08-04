@@ -1,6 +1,24 @@
 import streamlit as st
+import sys
+import os
 
-from tgcf.config import CONFIG, read_config, write_config
+# 检查并设置Python路径
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_dir = os.path.abspath(os.path.join(current_dir, '..', '..', '..'))
+
+if project_dir not in sys.path:
+    sys.path.append(project_dir)
+    st.write(f'添加项目目录到Python路径: {project_dir}')
+else:
+    st.write(f'项目目录已在Python路径中: {project_dir}')
+
+# 尝试导入tgcf模块
+try:
+    from tgcf.config import CONFIG, read_config, write_config
+    st.write('成功导入tgcf.config模块')
+except ImportError as e:
+    st.error(f'导入tgcf.config失败: {e}')
+    st.stop()
 from tgcf.web_ui.password import check_password
 from tgcf.web_ui.utils import hide_st, switch_theme
 
