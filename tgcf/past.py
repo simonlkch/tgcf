@@ -37,8 +37,22 @@ async def forward_job() -> None:
         SESSION, CONFIG.login.API_ID, CONFIG.login.API_HASH
     ) as client:
         config.from_to = await config.load_from_to(client, config.CONFIG.forwards)
+
+        def _is_enabled_forward(forward: config.Forward) -> bool:
+            if not forward.use_this:
+                return False
+            source = forward.source
+            if isinstance(source, int):
+                return True
+            if isinstance(source, str) and source.strip() != "":
+                return True
+            return False
+
+        # Keep forward metadata aligned with load_from_to() filtering logic.
+        active_forwards = [f for f in config.CONFIG.forwards if _is_enabled_forward(f)]
+
         client: TelegramClient
-        for from_to, forward in zip(config.from_to.items(), config.CONFIG.forwards):
+        for from_to, forward in zip(config.from_to.items(), active_forwards):
             src, dest = from_to
             last_id = 0
             forward: config.Forward
