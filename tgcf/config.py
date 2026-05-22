@@ -60,6 +60,12 @@ class PastSettings(BaseModel):
         return val
 
 
+class SessionEntry(BaseModel):
+    """A named Telegram user session."""
+    name: str = ""
+    session_string: str = ""
+
+
 class LoginConfig(BaseModel):
 
     API_ID: int = 0
@@ -67,8 +73,10 @@ class LoginConfig(BaseModel):
     user_type: int = 0  # 0:bot, 1:user
     phone_no: int = 91
     USERNAME: str = ""
-    SESSION_STRING: str = ""
+    SESSION_STRING: str = ""  # legacy – kept for backward compatibility
     BOT_TOKEN: str = ""
+    sessions: List[SessionEntry] = []
+    active_session: int = 0  # index into sessions list
 
 
 class BotMessages(BaseModel):
@@ -248,9 +256,19 @@ logging.info("config.py got executed")
 
 
 def get_SESSION(section: Any = CONFIG.login, default: str = 'tgcf_bot'):
-    if section.SESSION_STRING and section.user_type == 1:
-        logging.info("using session string")
-        SESSION = StringSession(section.SESSION_STRING)
+    if section.user_type == 1:
+        # Try multi-session list first
+        if section.sessions and 0 <= section.active_session < len(section.sessions):
+            sess_str = section.sessions[section.active_session].session_string
+            if sess_str:
+                logging.info("using session string from sessions list (index %d)", section.active_session)
+                return StringSession(sess_str)
+        # Fall back to legacy single SESSION_STRING
+        if section.SESSION_STRING:
+            logging.info("using legacy session string")
+            return StringSession(section.SESSION_STRING)
+        logging.warning("Login information not set!")
+        sys.exit()
     elif section.BOT_TOKEN and section.user_type == 0:
         logging.info("using bot account")
         SESSION = default

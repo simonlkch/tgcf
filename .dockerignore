@@ -16,6 +16,7 @@ t.yml
 todo
 *.txt
 *.ipynb
+.playwright-mcp/
 
 # Git
 .git

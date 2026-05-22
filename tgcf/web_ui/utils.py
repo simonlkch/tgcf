@@ -1,6 +1,6 @@
 import os
 from typing import Dict, List
-from run import package_dir
+from tgcf.web_ui.run import package_dir
 from streamlit.components.v1 import html
 from tgcf.config import write_config
 
@@ -46,10 +46,10 @@ def apply_theme(st,CONFIG,hidden_container):
         theme = 'Dark'
         CONFIG.theme = 'dark'
     write_config(CONFIG)
-    script = f"<script>localStorage.setItem('stActiveTheme-/-v1', '{{\"name\":\"{theme}\"}}');"
+    script = f"<script>localStorage.setItem('stActiveTheme-/-v2', '{{\"name\":\"{theme}\"}}');"
     pages = os.listdir(os.path.join(package_dir,'pages'))
     for page in pages:
-        script += f"localStorage.setItem('stActiveTheme-/{page[4:-3]}-v1', '{{\"name\":\"{theme}\"}}');"
+        script += f"localStorage.setItem('stActiveTheme-/{page[4:-3]}-v2', '{{\"name\":\"{theme}\"}}');"
     script += 'parent.location.reload()</script>'
     with hidden_container: # prevents the layout from shifting
         html(script,height=0,width=0)
@@ -64,7 +64,7 @@ def switch_theme(st,CONFIG):
                 'Theme:',['☀️','🌒'],
                 horizontal=True,
                 label_visibility="collapsed",
-                index=CONFIG.theme == 'dark',
+                index=1 if CONFIG.theme == 'dark' else 0,
                 on_change=apply_theme,
                 key="theme",
                 args=[st,CONFIG,leftpad] # or rightpad
