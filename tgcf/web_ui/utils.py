@@ -1,6 +1,6 @@
 import os
 from typing import Dict, List
-from run import package_dir
+from tgcf.web_ui.run import package_dir
 from streamlit.components.v1 import html
 from tgcf.config import write_config
 
@@ -64,7 +64,7 @@ def switch_theme(st,CONFIG):
                 'Theme:',['☀️','🌒'],
                 horizontal=True,
                 label_visibility="collapsed",
-                index=CONFIG.theme == 'dark',
+                index=1 if CONFIG.theme == 'dark' else 0,
                 on_change=apply_theme,
                 key="theme",
                 args=[st,CONFIG,leftpad] # or rightpad
