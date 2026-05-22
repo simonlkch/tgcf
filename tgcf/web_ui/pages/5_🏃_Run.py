@@ -106,14 +106,9 @@ if check_password(st):
         lines = st.slider(
             "Lines of logs to show", min_value=100, max_value=1000, step=100
         )
-        temp_logs = "logs_n_lines.txt"
-        os.system(f"rm {temp_logs}")
-        with open("logs.txt", "r") as file:
-            pass
-
-        os.system(f"tail -n {lines} logs.txt >> {temp_logs}")
-        with open(temp_logs, "r") as file:
-            st.code(file.read())
-    except FileNotFoundError as err:
+        with open("logs.txt", "r", encoding="utf8", errors="replace") as file:
+            log_lines = file.readlines()
+        st.code("".join(log_lines[-lines:]))
+    except FileNotFoundError:
         st.write("No present logs found")
     st.button("Load more logs")
