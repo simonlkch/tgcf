@@ -1,9 +1,29 @@
+# tgcf CLI integration targets
+cli: ## Run the CLI with arguments (e.g., make cli mode=live)
+	@poetry run python run_tgcf.py $(mode) $(args)
+
+run-live: ## Run tgcf in live mode
+	@$(MAKE) cli mode=live
+
+run-past: ## Run tgcf in past mode
+	@$(MAKE) cli mode=past
+
+run-live-verbose: ## Run tgcf in live mode with verbose output
+	@$(MAKE) cli mode=live args=--loud
+
+run-past-verbose: ## Run tgcf in past mode with verbose output
+	@$(MAKE) cli mode=past args=--loud
+
 # lists all available targets
 list:
 	@sh -c "$(MAKE) -p no_targets__ | \
 		awk -F':' '/^[a-zA-Z0-9][^\$$#\/\\t=]*:([^=]|$$)/ {\
 			split(\$$1,A,/ /);for(i in A)print A[i]\
 		}' | grep -v '__\$$' | grep -v 'make\[1\]' | grep -v 'Makefile' | sort"
+
+# Display this help message
+help:
+	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n\nTargets:\n"} /^[a-zA-Z0-9_-]+:.*?##/ { printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
 
 # required for list
 no_targets__:

@@ -2,7 +2,14 @@ from enum import Enum
 from typing import Any, Dict, List
 
 from pydantic import BaseModel
-from watermark import Position
+# Custom Position enum since watermark no longer provides it
+from enum import Enum
+
+class Position(str, Enum):
+    centre = "centre"
+    # Add other positions if needed
+
+
 
 
 class FileType(str, Enum):
