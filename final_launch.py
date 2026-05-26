@@ -2,6 +2,7 @@ import sys
 import os
 import subprocess
 import logging
+import threading
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s %(message)s')
@@ -31,25 +32,37 @@ def main():
 
         # 使用Python -m streamlit.run方式运行
         logger.info('启动Streamlit应用...')
+        env = os.environ.copy()
+        env['PYTHONUNBUFFERED'] = '1'
         process = subprocess.Popen(
-            [sys.executable, '-m', 'streamlit', 'run', hello_file],
+            [
+                sys.executable,
+                '-u',
+                '-m',
+                'streamlit',
+                'run',
+                hello_file,
+                '--logger.level=debug',
+            ],
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env=env,
         )
 
-        # 实时打印输出
-        while True:
-            output = process.stdout.readline()
-            if output == '' and process.poll() is not None:
-                break
-            if output:
-                logger.info(f'Streamlit输出: {output.strip()}')
+        def stream_output(pipe):
+            for raw in iter(pipe.readline, ''):
+                line = raw.rstrip('\n')
+                if line.strip() == '':
+                    logger.info('Streamlit输出: ')
+                    continue
+                logger.info(f'Streamlit输出: {line}')
 
-        # 打印错误（如果有）
-        stderr = process.stderr.read()
-        if stderr:
-            logger.error(f'Streamlit错误: {stderr}')
+        t = threading.Thread(target=stream_output, args=(process.stdout,), daemon=True)
+        t.start()
+        process.wait()
+        t.join(timeout=2)
 
         if process.returncode != 0:
             logger.error(f'Streamlit退出代码: {process.returncode}')

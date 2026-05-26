@@ -1,4 +1,5 @@
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -11,6 +12,71 @@ from tgcf.web_ui.password import check_password
 from tgcf.web_ui.utils import hide_st, switch_theme
 
 CONFIG = read_config()
+
+
+def _extract_progress(log_lines):
+    """Extract latest download progress line produced by tqdm."""
+
+    for line in reversed(log_lines):
+        if "download msg" not in line:
+            continue
+        msg_match = re.search(r"download msg\s+(\d+):\s*(\d+)%", line)
+        if not msg_match:
+            continue
+        size_match = re.search(r"\|\s*([0-9.]+[KMG]?)/([0-9.]+[KMG]?)", line)
+        return {
+            "message_id": int(msg_match.group(1)),
+            "percent": int(msg_match.group(2)),
+            "size": f"{size_match.group(1)}/{size_match.group(2)}" if size_match else "",
+            "line": line.strip(),
+        }
+    return None
+
+
+def _log_summary(log_lines):
+    return {
+        "total": len(log_lines),
+        "warning": sum(1 for line in log_lines if "WARNING" in line),
+        "error": sum(1 for line in log_lines if "ERROR" in line),
+    }
+
+
+def _extract_progress_history(log_lines, limit=200):
+    history = []
+    for line in log_lines:
+        if "download msg" not in line:
+            continue
+        match = re.search(r"download msg\s+(\d+):\s*(\d+)%", line)
+        if not match:
+            continue
+        history.append(
+            {
+                "message_id": int(match.group(1)),
+                "percent": int(match.group(2)),
+            }
+        )
+    return history[-limit:]
+
+
+def _extract_recent_events(log_lines, max_rows=80):
+    rows = []
+    for line in log_lines:
+        level = None
+        if " ERROR " in line:
+            level = "ERROR"
+        elif " WARNING " in line:
+            level = "WARNING"
+        elif " INFO " in line:
+            level = "INFO"
+        if not level:
+            continue
+        rows.append(
+            {
+                "level": level,
+                "message": line.strip(),
+            }
+        )
+    return rows[-max_rows:]
 
 
 def termination():
@@ -30,6 +96,7 @@ def termination():
 st.set_page_config(
     page_title="Run",
     page_icon="🏃",
+    layout="wide",
 )
 hide_st(st)
 switch_theme(st,CONFIG)
@@ -146,12 +213,93 @@ if check_password(st):
         st.rerun()
 
     try:
-        lines = st.slider(
-            "Lines of logs to show", min_value=100, max_value=1000, step=100
-        )
         with open("logs.txt", "r", encoding="utf8", errors="replace") as file:
             log_lines = file.readlines()
-        st.code("".join(log_lines[-lines:]))
+
+        summary = _log_summary(log_lines)
+        metric_1, metric_2, metric_3, metric_4 = st.columns(4)
+        metric_1.metric("Log lines", summary["total"])
+        metric_2.metric("Warnings", summary["warning"])
+        metric_3.metric("Errors", summary["error"])
+        metric_4.metric("Process", "Running" if CONFIG.pid != 0 else "Stopped")
+
+        progress = _extract_progress(log_lines)
+        if progress:
+            st.info(
+                f"Message {progress['message_id']} transfer: {progress['percent']}% {progress['size']}"
+            )
+            st.progress(progress["percent"] / 100)
+
+        progress_history = _extract_progress_history(log_lines)
+        recent_events = _extract_recent_events(log_lines)
+
+        tabs = st.tabs(["Overview", "Events", "Logs"])
+
+        with tabs[0]:
+            left, right = st.columns([2, 1])
+            with left:
+                if progress_history:
+                    st.write("Transfer progress trend")
+                    st.line_chart(
+                        {
+                            "percent": [item["percent"] for item in progress_history],
+                        },
+                        use_container_width=True,
+                    )
+                else:
+                    st.info("No transfer progress data yet.")
+            with right:
+                if progress:
+                    st.write("Latest transfer")
+                    st.dataframe([progress], use_container_width=True)
+                st.write("Health summary")
+                st.dataframe([summary], use_container_width=True)
+
+        with tabs[1]:
+            if recent_events:
+                st.dataframe(recent_events, use_container_width=True, height=520)
+            else:
+                st.info("No INFO/WARNING/ERROR events found yet.")
+
+        with tabs[2]:
+            ctl_left, ctl_mid, ctl_right, ctl_four = st.columns(4)
+            with ctl_left:
+                lines = st.slider(
+                    "Lines of logs to show", min_value=100, max_value=5000, step=100, value=1000
+                )
+            with ctl_mid:
+                keyword = st.text_input("Filter keyword", value="")
+            with ctl_right:
+                only_problems = st.checkbox("Only warnings/errors", value=False)
+            with ctl_four:
+                if st.button("Refresh logs"):
+                    st.rerun()
+
+            visible_lines = log_lines
+            if keyword.strip():
+                lowered = keyword.strip().lower()
+                visible_lines = [line for line in visible_lines if lowered in line.lower()]
+            if only_problems:
+                visible_lines = [
+                    line
+                    for line in visible_lines
+                    if "WARNING" in line or "ERROR" in line
+                ]
+
+            tail_text = "".join(visible_lines[-lines:])
+            st.text_area(
+                "Log output",
+                value=tail_text,
+                height=560,
+                disabled=True,
+            )
+            st.caption(f"Showing {min(lines, len(visible_lines))} line(s)")
+            st.download_button(
+                "Download visible logs",
+                data=tail_text,
+                file_name="tgcf_visible_logs.txt",
+            )
+
     except FileNotFoundError:
         st.write("No present logs found")
     st.button("Load more logs")

@@ -19,6 +19,23 @@ MAX_FLOOD_WAIT_RETRIES = 10
 FORWARD_RESTRICTED_PAIRS = set()
 
 
+def _preview_text(text: Optional[str], limit: int = 120) -> str:
+    """Return a compact single-line preview for logs."""
+
+    clean = (text or "").replace("\n", " ").strip()
+    if not clean:
+        return "(no text/caption)"
+    if len(clean) <= limit:
+        return clean
+    return clean[: limit - 3] + "..."
+
+
+def _message_preview(message: Message) -> str:
+    """Build a short preview from message body/caption for log visibility."""
+
+    return _preview_text(getattr(message, "message", "") or "")
+
+
 @dataclass(frozen=True)
 class ForwardBatch:
     """A normalized forwarding unit.
@@ -178,12 +195,13 @@ async def forward_source_batch(messages: List[Message], destinations: List[int])
         sent_messages = []
         try:
             logging.info(
-                "sending batch: source_chat=%s grouped_id=%s destination=%s message_count=%s reply_to=%s",
+                "sending batch: source_chat=%s grouped_id=%s destination=%s message_count=%s reply_to=%s first_caption=%s",
                 source_chat_id,
                 grouped_id,
                 dest,
                 len(ordered_messages),
                 reply_to,
+                _message_preview(ordered_messages[0]),
             )
             sent_messages = await forward_batch_with_retry(
                 dest,
@@ -339,9 +357,17 @@ async def send_batch(
 
     from tgcf.config import CONFIG
     from tgcf.plugins import apply_plugins
-    from tgcf.utils import send_message
+    from tgcf.utils import cleanup, send_message
 
     transformed = []
+    fallback_downloaded_files: List[str] = []
+
+    async def _get_downloaded_file(tm):
+        file_path = await tm.get_file()
+        if file_path:
+            fallback_downloaded_files.append(file_path)
+        return file_path
+
     try:
         for message in messages:
             tm = await apply_plugins(message)
@@ -398,13 +424,19 @@ async def send_batch(
                     raise
 
                 logging.warning(
-                    "send_message blocked by protected chat; retrying as send_file recipient=%s",
+                    "send_message blocked by protected chat; retrying as send_file recipient=%s caption=%s",
                     recipient,
+                    _preview_text(tm.text),
                 )
                 logging.info("Fallback phase: preparing downloadable media for recipient=%s", recipient)
-                file_path = tm.new_file or await tm.get_file()
+                file_path = tm.new_file or await _get_downloaded_file(tm)
                 try:
-                    logging.info("Fallback phase: uploading media file=%s recipient=%s", file_path, recipient)
+                    logging.info(
+                        "Fallback phase: uploading media file=%s recipient=%s caption=%s",
+                        file_path,
+                        recipient,
+                        _preview_text(tm.text),
+                    )
                     sent = await client.send_file(
                         recipient,
                         file_path,
@@ -412,16 +444,18 @@ async def send_batch(
                         reply_to=reply_to,
                     )
                     logging.info(
-                        "send_file fallback succeeded: recipient=%s file=%s",
+                        "send_file fallback succeeded: recipient=%s file=%s caption=%s",
                         recipient,
                         file_path,
+                        _preview_text(tm.text),
                     )
                     return sent
                 except Exception:
                     logging.exception(
-                        "send_file fallback failed: recipient=%s file=%s",
+                        "send_file fallback failed: recipient=%s file=%s caption=%s",
                         recipient,
                         file_path,
+                        _preview_text(tm.text),
                     )
                     raise
 
@@ -440,7 +474,7 @@ async def send_batch(
                 file_paths.append(tm.new_file)
                 continue
             if tm.file_type != FileType.NOFILE:
-                file_paths.append(await tm.get_file())
+                file_paths.append(await _get_downloaded_file(tm))
                 continue
             break
         else:
@@ -463,3 +497,5 @@ async def send_batch(
     finally:
         for tm in transformed:
             tm.clear()
+        if fallback_downloaded_files:
+            cleanup(*set(fallback_downloaded_files))
