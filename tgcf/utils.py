@@ -16,6 +16,9 @@ from tgcf import __version__
 from tgcf.config import CONFIG
 from tgcf.plugin_models import STYLE_CODES
 
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+TEMP_DIR = os.path.join(BASE_DIR, "temp")
+
 if TYPE_CHECKING:
     from tgcf.plugins import TgcfMessage
 
@@ -27,6 +30,11 @@ def platform_info():
     \nOS {os.name}\
     \nPlatform {platform.system()} {platform.release()}\
     \n{platform.architecture()} {platform.processor()}"""
+
+
+def get_temp_dir() -> str:
+    os.makedirs(TEMP_DIR, exist_ok=True)
+    return TEMP_DIR
 
 
 async def send_message(recipient: EntityLike, tm: "TgcfMessage") -> Message:
@@ -55,7 +63,9 @@ def cleanup(*files: str) -> None:
 def stamp(file: str, user: str) -> str:
     """Stamp the filename with the datetime, and user info."""
     now = str(datetime.now())
-    outf = safe_name(f"{user} {now} {file}")
+    folder = os.path.dirname(file) or get_temp_dir()
+    base_name = os.path.basename(file)
+    outf = os.path.join(folder, safe_name(f"{user} {now} {base_name}"))
     try:
         os.rename(file, outf)
         return outf

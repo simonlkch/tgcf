@@ -15,6 +15,7 @@ tgcf.config.json
 todo
 *.ipynb
 .playwright-mcp/
+temp/
 
 
 # Byte-compiled / optimized / DLL files

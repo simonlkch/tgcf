@@ -1,4 +1,4 @@
-from typing import Dict
+from typing import Dict, Optional, Tuple
 
 from pymongo.collection import Collection
 from telethon.tl.custom.message import Message
@@ -31,5 +31,12 @@ class DummyEvent:
 
 
 stored: Dict[EventUid, Dict[int, Message]] = {}
+stored_albums: Dict[Tuple[int, int], Dict[int, Message]] = {}
 CONFIG_TYPE: int = 0
 mycol: Collection = None
+
+
+def album_key(chat_id: int, grouped_id: Optional[int]) -> Optional[Tuple[int, int]]:
+    if grouped_id is None:
+        return None
+    return chat_id, grouped_id

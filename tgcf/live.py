@@ -1,20 +1,60 @@
 """The module responsible for operating tgcf in live mode."""
 
+import asyncio
 import logging
-import os
 import sys
-from typing import Union
+from typing import Dict, List, Tuple, Union
 
 from telethon import TelegramClient, events, functions, types
-from telethon.sessions import StringSession
 from telethon.tl.custom.message import Message
 
 from tgcf import config, const
 from tgcf import storage as st
 from tgcf.bot import get_events
 from tgcf.config import CONFIG, get_SESSION
+from tgcf.forwarding import forward_source_batch
 from tgcf.plugins import apply_plugins, load_async_plugins
-from tgcf.utils import clean_session_files, send_message
+from tgcf.utils import clean_session_files
+
+
+album_buffers: Dict[Tuple[int, int], List[Message]] = {}
+album_tasks: Dict[Tuple[int, int], asyncio.Task] = {}
+
+
+async def _flush_album_later(album_uid: Tuple[int, int]) -> None:
+    try:
+        await asyncio.sleep(CONFIG.live.album_debounce_ms / 1000)
+        messages = album_buffers.pop(album_uid, [])
+        album_tasks.pop(album_uid, None)
+        if not messages:
+            return
+        await forward_source_batch(messages, config.from_to.get(album_uid[0], []))
+    except asyncio.CancelledError:
+        return
+    except Exception as err:
+        logging.exception(err)
+
+
+async def _queue_album_message(message: Message) -> None:
+    album_uid = st.album_key(message.chat_id, getattr(message, "grouped_id", None))
+    if album_uid is None:
+        return
+
+    album_buffers.setdefault(album_uid, []).append(message)
+    album_buffers[album_uid].sort(key=lambda item: item.id)
+
+    task = album_tasks.get(album_uid)
+    if task and not task.done():
+        task.cancel()
+
+    album_tasks[album_uid] = asyncio.create_task(_flush_album_later(album_uid))
+
+
+async def _forward_single_message(message: Message) -> None:
+    destinations = config.from_to.get(message.chat_id)
+    if not destinations:
+        return
+    await forward_source_batch([message], destinations)
 
 
 async def new_message_handler(event: Union[Message, events.NewMessage]) -> None:
@@ -26,8 +66,6 @@ async def new_message_handler(event: Union[Message, events.NewMessage]) -> None:
     logging.info(f"New message received in {chat_id}")
     message = event.message
 
-    event_uid = st.EventUid(event)
-
     length = len(st.stored)
     exceeding = length - const.KEEP_LAST_MANY
 
@@ -36,23 +74,11 @@ async def new_message_handler(event: Union[Message, events.NewMessage]) -> None:
             del st.stored[key]
             break
 
-    dest = config.from_to.get(chat_id)
-
-    tm = await apply_plugins(message)
-    if not tm:
+    if getattr(message, "grouped_id", None) is None:
+        await _forward_single_message(message)
         return
 
-    if event.is_reply:
-        r_event = st.DummyEvent(chat_id, event.reply_to_msg_id)
-        r_event_uid = st.EventUid(r_event)
-
-    st.stored[event_uid] = {}
-    for d in dest:
-        if event.is_reply and r_event_uid in st.stored:
-            tm.reply_to = st.stored.get(r_event_uid).get(d)
-        fwded_msg = await send_message(d, tm)
-        st.stored[event_uid].update({d: fwded_msg})
-    tm.clear()
+    await _queue_album_message(message)
 
 
 async def edited_message_handler(event) -> None:
@@ -67,28 +93,24 @@ async def edited_message_handler(event) -> None:
     logging.info(f"Message edited in {chat_id}")
 
     event_uid = st.EventUid(event)
-
-    tm = await apply_plugins(message)
-
-    if not tm:
-        return
-
     fwded_msgs = st.stored.get(event_uid)
 
     if fwded_msgs:
-        for _, msg in fwded_msgs.items():
-            if config.CONFIG.live.delete_on_edit == message.text:
-                await msg.delete()
-                await message.delete()
-            else:
-                await msg.edit(tm.text)
+        tm = await apply_plugins(message)
+        if not tm:
+            return
+        try:
+            for _, msg in fwded_msgs.items():
+                if config.CONFIG.live.delete_on_edit == message.text:
+                    await msg.delete()
+                    await message.delete()
+                else:
+                    await msg.edit(tm.text)
+        finally:
+            tm.clear()
         return
 
-    dest = config.from_to.get(chat_id)
-
-    for d in dest:
-        await send_message(d, tm)
-    tm.clear()
+    await _forward_single_message(message)
 
 
 async def deleted_message_handler(event):

@@ -6,7 +6,6 @@
 
 import asyncio
 import logging
-import time
 
 from telethon import TelegramClient
 from telethon.errors.rpcerrorlist import FloodWaitError
@@ -14,18 +13,19 @@ from telethon.tl.custom.message import Message
 from telethon.tl.patched import MessageService
 
 from tgcf import config
-from tgcf import storage as st
 from tgcf.config import CONFIG, get_SESSION, write_config
-from tgcf.plugins import apply_plugins, load_async_plugins
-from tgcf.utils import clean_session_files, send_message
+from tgcf.forwarding import build_forward_batches, forward_source_batch
+from tgcf.plugins import load_async_plugins
+from tgcf.utils import clean_session_files
 
 
 async def forward_job() -> None:
     """Forward all existing messages in the concerned chats."""
+    logging.info("past forward_job started")
     clean_session_files()
 
     # load async plugins defined in plugin_models
-    await load_async_plugins()    
+    await load_async_plugins()
 
     if CONFIG.login.user_type != 1:
         logging.warning(
@@ -55,45 +55,111 @@ async def forward_job() -> None:
         for from_to, forward in zip(config.from_to.items(), active_forwards):
             src, dest = from_to
             last_id = 0
+            scanned_count = 0
+            accepted_count = 0
+            previous_grouped_id = None
+            exact_id_mode = bool(
+                forward.offset
+                and forward.end
+                and int(forward.offset) == int(forward.end)
+            )
             forward: config.Forward
-            logging.info(f"Forwarding messages from {src} to {dest}")
-            async for message in client.iter_messages(
-                src, reverse=True, offset_id=forward.offset
-            ):
-                message: Message
-                event = st.DummyEvent(message.chat_id, message.id)
-                event_uid = st.EventUid(event)
+            logging.info(
+                "Forwarding messages from %s to %s (offset=%s, end=%s)",
+                src,
+                dest,
+                forward.offset,
+                forward.end,
+            )
+            if exact_id_mode:
+                logging.info(
+                    "Exact-id mode enabled for source=%s id=%s",
+                    src,
+                    forward.offset,
+                )
 
-                if forward.end and last_id > forward.end:
-                    continue
-                if isinstance(message, MessageService):
-                    continue
-                try:
-                    tm = await apply_plugins(message)
-                    if not tm:
-                        continue
-                    st.stored[event_uid] = {}
+            current_batch = []
 
-                    if message.is_reply:
-                        r_event = st.DummyEvent(
-                            message.chat_id, message.reply_to_msg_id
-                        )
-                        r_event_uid = st.EventUid(r_event)
-                    for d in dest:
-                        if message.is_reply and r_event_uid in st.stored:
-                            tm.reply_to = st.stored.get(r_event_uid).get(d)
-                        fwded_msg = await send_message(d, tm)
-                        st.stored[event_uid].update({d: fwded_msg.id})
-                    tm.clear()
-                    last_id = message.id
+            async def flush_batch():
+                nonlocal last_id, current_batch
+                if not current_batch:
+                    return
+                for batch in build_forward_batches(current_batch):
+                    await forward_source_batch(batch.messages, dest)
+                    last_id = batch.messages[-1].id
                     logging.info(f"forwarding message with id = {last_id}")
                     forward.offset = last_id
                     write_config(CONFIG, persist=False)
-                    time.sleep(CONFIG.past.delay)
+                    await asyncio.sleep(CONFIG.past.delay)
                     logging.info(f"slept for {CONFIG.past.delay} seconds")
+                current_batch = []
 
+            async def handle_message(message: Message):
+                nonlocal scanned_count, accepted_count, previous_grouped_id
+                scanned_count += 1
+
+                if scanned_count % 200 == 0:
+                    logging.info(
+                        "Scanning progress for %s: scanned=%s accepted=%s last_forwarded_id=%s",
+                        src,
+                        scanned_count,
+                        accepted_count,
+                        last_id,
+                    )
+
+                if forward.end and message.id > forward.end:
+                    return
+                if isinstance(message, MessageService):
+                    return
+
+                current_grouped_id = getattr(message, "grouped_id", None)
+                if current_batch and previous_grouped_id != current_grouped_id:
+                    await flush_batch()
+                current_batch.append(message)
+                accepted_count += 1
+                previous_grouped_id = current_grouped_id
+
+                if current_grouped_id is None:
+                    await flush_batch()
+
+            if exact_id_mode:
+                try:
+                    message = await client.get_messages(src, ids=forward.offset)
+                    if message:
+                        await handle_message(message)
                 except FloodWaitError as fwe:
                     logging.info(f"Sleeping for {fwe}")
                     await asyncio.sleep(delay=fwe.seconds)
                 except Exception as err:
                     logging.exception(err)
+            else:
+                async for message in client.iter_messages(
+                    src, reverse=True, offset_id=forward.offset
+                ):
+                    message: Message
+                    try:
+                        await handle_message(message)
+                    except FloodWaitError as fwe:
+                        logging.info(f"Sleeping for {fwe}")
+                        await asyncio.sleep(delay=fwe.seconds)
+                    except Exception as err:
+                        logging.exception(err)
+
+            try:
+                await flush_batch()
+                logging.info(
+                    "Completed source %s: scanned=%s accepted=%s last_forwarded_id=%s",
+                    src,
+                    scanned_count,
+                    accepted_count,
+                    last_id,
+                )
+                if accepted_count == 0:
+                    logging.warning(
+                        "No eligible messages found for source=%s with offset=%s end=%s",
+                        src,
+                        forward.offset,
+                        forward.end,
+                    )
+            except Exception as err:
+                logging.exception(err)

@@ -1,6 +1,7 @@
 import os
 import signal
 import subprocess
+import sys
 import time
 
 import streamlit as st
@@ -33,6 +34,28 @@ st.set_page_config(
 hide_st(st)
 switch_theme(st,CONFIG)
 if check_password(st):
+    with st.expander("Current Runtime Summary", expanded=True):
+        st.write(f"**Mode:** {'past' if CONFIG.mode == 1 else 'live'}")
+        st.write(f"**Show Forwarded from:** {'Yes' if CONFIG.show_forwarded_from else 'No'}")
+        st.write(f"**Live delete sync:** {'Yes' if CONFIG.live.delete_sync else 'No'}")
+        st.write(f"**Album debounce:** {CONFIG.live.album_debounce_ms} ms")
+        st.write(f"**Album atomic rollback:** {'Yes' if CONFIG.live.album_atomic else 'No'}")
+        st.write(
+            f"**Fallback re-upload when forward is blocked:** {'Yes' if CONFIG.live.forward_fallback_to_reupload else 'No'}"
+        )
+        st.write(f"**Retry on 429 / FloodWait:** {'Yes' if CONFIG.live.retry_on_429 else 'No'}")
+        st.write(
+            f"**Retry backoff base:** {CONFIG.live.retry_backoff_base_seconds} seconds"
+        )
+        st.write(
+            f"**Max retries for non-429 errors:** {CONFIG.live.retry_max_attempts_for_non_429}"
+        )
+        st.write(
+            f"**Max retries for 429 / FloodWait:** {CONFIG.live.retry_max_attempts_for_flood_wait}"
+        )
+        if CONFIG.mode == 1:
+            st.write(f"**Past delay:** {CONFIG.past.delay} seconds")
+
     with st.expander("Configure Run"):
         CONFIG.show_forwarded_from = st.checkbox(
             "Show 'Forwarded from'", value=CONFIG.show_forwarded_from
@@ -66,7 +89,7 @@ if check_password(st):
         )
         # check if process is running using pid
         try:
-            os.kill(CONFIG.pid, signal.SIGCONT)
+            os.kill(CONFIG.pid, 0)
         except Exception as err:
             st.code("The process has stopped.")
             st.code(err)
@@ -78,7 +101,7 @@ if check_password(st):
         stop = st.button("Stop", type="primary")
         if stop:
             try:
-                os.kill(CONFIG.pid, signal.SIGSTOP)
+                os.kill(CONFIG.pid, signal.SIGTERM)
             except Exception as err:
                 st.code(err)
 
@@ -90,14 +113,34 @@ if check_password(st):
                 termination()
 
     if check:
+        project_root = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "..")
+        )
+        run_script = os.path.join(project_root, "run_tgcf.py")
+        run_mode = "past" if CONFIG.mode == 1 else "live"
         with open("logs.txt", "w") as logs:
+            popen_kwargs = {
+                "stdout": logs,
+                "stderr": subprocess.STDOUT,
+                "stdin": subprocess.DEVNULL,
+            }
+            if os.name == "nt":
+                popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                popen_kwargs["start_new_session"] = True
+
             process = subprocess.Popen(
-                ["tgcf", "--loud", mode],
-                stdout=logs,
-                stderr=subprocess.STDOUT,
+                [sys.executable, run_script, run_mode, "--loud"],
+                **popen_kwargs,
             )
-        CONFIG.pid = process.pid
-        write_config(CONFIG)
+
+        if process.poll() is None:
+            CONFIG.pid = process.pid
+            write_config(CONFIG)
+        else:
+            CONFIG.pid = 0
+            write_config(CONFIG)
+            st.error(f"tgcf exited immediately with code {process.returncode}. Check logs below.")
         time.sleep(2)
 
         st.rerun()

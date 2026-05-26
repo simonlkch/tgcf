@@ -95,6 +95,49 @@ if check_password(st):
             st.write(
                 "When you edit the message in source to something particular, the message will be deleted in both source and destinations."
             )
+
+        with st.expander("Album & Retry Settings"):
+            CONFIG.live.album_debounce_ms = st.number_input(
+                "Album debounce (ms)",
+                min_value=100,
+                max_value=10000,
+                value=CONFIG.live.album_debounce_ms,
+                step=100,
+            )
+            CONFIG.live.album_atomic = st.checkbox(
+                "Rollback album on any destination failure",
+                value=CONFIG.live.album_atomic,
+            )
+            CONFIG.live.forward_fallback_to_reupload = st.checkbox(
+                "Fallback to download and re-upload when forward is blocked",
+                value=CONFIG.live.forward_fallback_to_reupload,
+            )
+            CONFIG.live.retry_on_429 = st.checkbox(
+                "Retry on 429 / FloodWait",
+                value=CONFIG.live.retry_on_429,
+            )
+            CONFIG.live.retry_backoff_base_seconds = st.number_input(
+                "Retry backoff base (seconds)",
+                min_value=1,
+                max_value=60,
+                value=CONFIG.live.retry_backoff_base_seconds,
+                step=1,
+            )
+            CONFIG.live.retry_max_attempts_for_non_429 = st.number_input(
+                "Max retries for non-429 errors",
+                min_value=0,
+                max_value=10,
+                value=CONFIG.live.retry_max_attempts_for_non_429,
+                step=1,
+            )
+            CONFIG.live.retry_max_attempts_for_flood_wait = st.number_input(
+                "Max retries for 429 / FloodWait",
+                min_value=0,
+                max_value=20,
+                value=CONFIG.live.retry_max_attempts_for_flood_wait,
+                step=1,
+            )
+
             if st.checkbox("Customize Bot Messages"):
                 st.info(
                     "Note: For userbots, the commands start with `.` instead of `/`, like `.start` and not `/start`"

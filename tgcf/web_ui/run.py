@@ -1,4 +1,6 @@
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 from tgcf.config import CONFIG
@@ -11,4 +13,8 @@ def main():
     os.environ["STREAMLIT_THEME_BASE"] = CONFIG.theme
     os.environ["STREAMLIT_BROWSER_GATHER_USAGE_STATS"] = "false"
     os.environ["STREAMLIT_SERVER_HEADLESS"] = "true"
-    os.system(f"streamlit run {path}")
+    cmd = [sys.executable, "-m", "streamlit", "run", path]
+    try:
+        subprocess.run(cmd, check=False)
+    except KeyboardInterrupt:
+        return

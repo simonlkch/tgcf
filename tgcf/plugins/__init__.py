@@ -5,16 +5,23 @@ Contains all the first-party tgcf plugins.
 
 
 import inspect
+import json
 import logging
+import os
+import re
+import time
 from enum import Enum
 from importlib import import_module
 from typing import Any, Dict
 
+from hachoir.metadata import extractMetadata
+from hachoir.parser import createParser
 from telethon.tl.custom.message import Message
+from tqdm import tqdm
 
 from tgcf.config import CONFIG
 from tgcf.plugin_models import FileType, ASYNC_PLUGIN_IDS
-from tgcf.utils import cleanup, stamp
+from tgcf.utils import cleanup, get_temp_dir, safe_name
 
 PLUGINS = CONFIG.plugins
 
@@ -31,12 +38,360 @@ class TgcfMessage:
         self.reply_to = None
         self.client = self.message.client
 
+    def _has_valid_video_duration(self, file_path: str) -> bool:
+        try:
+            parser = createParser(file_path)
+        except Exception:
+            return False
+        if not parser:
+            return False
+        try:
+            metadata = extractMetadata(parser)
+        except Exception:
+            return False
+        finally:
+            try:
+                parser.close()
+            except Exception:
+                pass
+
+        if not metadata or not metadata.has("duration"):
+            return False
+
+        duration = metadata.get("duration")
+        if hasattr(duration, "total_seconds"):
+            return duration.total_seconds() > 0
+        if isinstance(duration, (int, float)):
+            return duration > 0
+        return False
+
+    def _source_video_has_duration(self) -> bool:
+        document = getattr(self.message, "document", None)
+        if document is None:
+            return False
+        for attr in getattr(document, "attributes", []):
+            duration = getattr(attr, "duration", None)
+            if isinstance(duration, (int, float)) and duration > 0:
+                return True
+        return False
+
+    def _safe_log_path(self, file_path: str) -> str:
+        raw = os.path.basename(file_path or "")
+        safe = safe_name(raw)
+        return safe.encode("ascii", errors="backslashreplace").decode("ascii")
+
+    def _is_valid_media_file(self, file_path: str, expected_size: int) -> bool:
+        if not file_path or not os.path.exists(file_path):
+            return False
+
+        size = os.path.getsize(file_path)
+        if size <= 0:
+            return False
+
+        if expected_size is not None and size != expected_size:
+            return False
+
+        if self.file_type in (FileType.VIDEO, FileType.VIDEO_NOTE):
+            if not self._has_valid_video_duration(file_path):
+                if not self._source_video_has_duration():
+                    logging.warning(
+                        "Invalid video duration for file=%s",
+                        self._safe_log_path(file_path),
+                    )
+                    return False
+                logging.info(
+                    "Video parser check skipped; source has duration, file=%s",
+                    self._safe_log_path(file_path),
+                )
+
+        return True
+
     async def get_file(self) -> str:
         """Downloads the file in the message and returns the path where its saved."""
         if self.file_type == FileType.NOFILE:
             raise FileNotFoundError("No file exists in this message.")
-        self.file = stamp(await self.message.download_media(""), self.sender_id)
-        return self.file
+        downloaded = None
+        temp_dir = get_temp_dir()
+        part_size_kb = 512
+        file_meta = getattr(self.message, "file", None)
+        expected_size = getattr(file_meta, "size", None)
+        file_name = getattr(file_meta, "name", None)
+        if not file_name:
+            file_name = f"msg_{getattr(self.message, 'id', 'unknown')}.bin"
+        cache_name = f"{getattr(self.message, 'id', 'unknown')}_{safe_name(file_name)}"
+        target_path = os.path.join(temp_dir, cache_name)
+        part_path = target_path + ".part"
+        meta_path = target_path + ".meta"
+
+        def _write_resume_meta(offset: int) -> None:
+            payload = {
+                "offset": offset,
+                "expected_size": expected_size,
+                "updated_at": int(time.time()),
+                "file_name": file_name,
+            }
+            try:
+                with open(meta_path, "w", encoding="utf-8") as fp:
+                    json.dump(payload, fp)
+            except OSError:
+                pass
+
+        def _read_resume_offset() -> int:
+            offset = os.path.getsize(part_path) if os.path.exists(part_path) else 0
+            if offset <= 0:
+                return 0
+            if expected_size is not None and offset >= expected_size:
+                return 0
+
+            if not os.path.exists(meta_path):
+                return offset
+
+            try:
+                with open(meta_path, "r", encoding="utf-8") as fp:
+                    payload = json.load(fp)
+            except Exception:
+                return offset
+
+            meta_expected = payload.get("expected_size")
+            if expected_size is not None and meta_expected not in (None, expected_size):
+                return 0
+
+            meta_offset = payload.get("offset")
+            if isinstance(meta_offset, int) and 0 < meta_offset <= offset:
+                return meta_offset
+
+            return offset
+
+        def _normalize_name(value: str) -> str:
+            value = re.sub(r"\(\d+\)(?=\.[^.]+$)", "", value)
+            return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", value.lower())
+
+        expected_norm = _normalize_name(file_name)
+
+        # Reuse any valid pre-existing blob in temp, including files downloaded by older naming schemes.
+        candidates = []
+        for entry in os.scandir(temp_dir):
+            if not entry.is_file():
+                continue
+            candidate_name = entry.name
+            if expected_size is not None and os.path.getsize(entry.path) != expected_size:
+                continue
+            if expected_norm and expected_norm not in _normalize_name(candidate_name):
+                continue
+            if self._is_valid_media_file(entry.path, expected_size):
+                candidates.append(entry.path)
+
+        # If strict name matching misses legacy blobs, reuse any valid same-size file.
+        if not candidates and expected_size is not None:
+            for entry in os.scandir(temp_dir):
+                if not entry.is_file():
+                    continue
+                if os.path.getsize(entry.path) != expected_size:
+                    continue
+                if self._is_valid_media_file(entry.path, expected_size):
+                    candidates.append(entry.path)
+
+        if candidates:
+            chosen = max(candidates, key=os.path.getmtime)
+            logging.info("Reusing existing temp media=%s", self._safe_log_path(chosen))
+            self.new_file = chosen
+            self.cleanup = False
+            return self.new_file
+
+        if os.path.exists(target_path):
+            if self._is_valid_media_file(target_path, expected_size):
+                size = os.path.getsize(target_path)
+                logging.info(
+                    "Using cached media file=%s size=%s bytes",
+                    self._safe_log_path(target_path),
+                    size,
+                )
+                self.new_file = target_path
+                self.cleanup = False
+                return self.new_file
+
+            # Keep partial files for resume instead of always restarting from zero.
+            try:
+                existing_size = os.path.getsize(target_path)
+            except OSError:
+                existing_size = 0
+            if (
+                expected_size is not None
+                and existing_size > 0
+                and existing_size < expected_size
+            ):
+                try:
+                    os.replace(target_path, part_path)
+                    _write_resume_meta(existing_size)
+                    logging.info(
+                        "Moved partial cache to resume buffer file=%s bytes=%s",
+                        self._safe_log_path(part_path),
+                        existing_size,
+                    )
+                except OSError:
+                    pass
+
+            logging.warning(
+                "Cached media is invalid, re-downloading: %s",
+                self._safe_log_path(target_path),
+            )
+            try:
+                os.remove(target_path)
+            except OSError:
+                pass
+
+        for attempt in range(1, 4):
+            progress_bar = None
+            downloaded_bytes = 0
+            downloaded = None
+
+            def progress_callback(current: int, total: int):
+                nonlocal progress_bar, downloaded_bytes
+                if progress_bar is None:
+                    progress_bar = tqdm(
+                        total=total or None,
+                        unit="B",
+                        unit_scale=True,
+                        unit_divisor=1024,
+                        desc=f"download msg {getattr(self.message, 'id', None)}",
+                        leave=False,
+                    )
+                if total and progress_bar.total != total:
+                    progress_bar.total = total
+                delta = current - downloaded_bytes
+                if delta > 0:
+                    progress_bar.update(delta)
+                    downloaded_bytes = current
+
+            logging.info(
+                "Downloading media for message_id=%s sender_id=%s into temp directory (attempt %s)",
+                getattr(self.message, "id", None),
+                self.sender_id,
+                attempt,
+            )
+            try:
+                document = getattr(self.message, "document", None)
+                if document is not None:
+                    resume_from = _read_resume_offset()
+                    if expected_size is not None and resume_from >= expected_size:
+                        resume_from = 0
+
+                    mode = "ab" if resume_from > 0 else "wb"
+                    if resume_from > 0:
+                        logging.info(
+                            "Resuming media download from offset=%s file=%s",
+                            resume_from,
+                            self._safe_log_path(part_path),
+                        )
+
+                    with open(part_path, mode) as fp:
+                        current = resume_from
+                        if progress_bar is None:
+                            progress_bar = tqdm(
+                                total=expected_size or None,
+                                initial=resume_from,
+                                unit="B",
+                                unit_scale=True,
+                                unit_divisor=1024,
+                                desc=f"download msg {getattr(self.message, 'id', None)}",
+                                leave=False,
+                            )
+                        downloaded_bytes = resume_from
+
+                        async for chunk in self.client.iter_download(
+                            document,
+                            offset=resume_from,
+                            chunk_size=part_size_kb * 1024,
+                            request_size=part_size_kb * 1024,
+                            file_size=expected_size,
+                        ):
+                            if not chunk:
+                                continue
+                            fp.write(chunk)
+                            current += len(chunk)
+                            progress_callback(current, expected_size or current)
+                            if current % (1024 * 1024) == 0:
+                                _write_resume_meta(current)
+
+                    _write_resume_meta(os.path.getsize(part_path))
+                    if expected_size is not None and os.path.getsize(part_path) != expected_size:
+                        raise IOError(
+                            "Partial download size mismatch: "
+                            f"{os.path.getsize(part_path)} != {expected_size}"
+                        )
+
+                    os.replace(part_path, target_path)
+                    try:
+                        os.remove(meta_path)
+                    except OSError:
+                        pass
+                    downloaded = target_path
+                else:
+                    downloaded = await self.message.download_media(
+                        temp_dir, progress_callback=progress_callback
+                    )
+                    if downloaded and os.path.exists(downloaded) and downloaded != target_path:
+                        os.replace(downloaded, target_path)
+                        downloaded = target_path
+            except Exception as err:
+                err_name = err.__class__.__name__
+                err_text = str(err).upper()
+                if err_name == "FileReferenceExpiredError" or "FILE_REFERENCE_EXPIRED" in err_text:
+                    logging.warning(
+                        "File reference expired for message_id=%s; refetching and retrying attempt=%s",
+                        getattr(self.message, "id", None),
+                        attempt,
+                    )
+                    try:
+                        refreshed = await self.client.get_messages(
+                            self.message.chat_id,
+                            ids=self.message.id,
+                        )
+                        if refreshed:
+                            self.message = refreshed
+                            self.client = self.message.client
+                    except Exception:
+                        logging.exception(
+                            "Failed to refresh message reference for message_id=%s",
+                            getattr(self.message, "id", None),
+                        )
+                    continue
+                if attempt < 3:
+                    logging.warning(
+                        "Download attempt failed for message_id=%s attempt=%s error=%s",
+                        getattr(self.message, "id", None),
+                        attempt,
+                        err,
+                    )
+                    continue
+                raise
+            finally:
+                if progress_bar is not None:
+                    progress_bar.close()
+            if downloaded and os.path.exists(downloaded):
+                size = os.path.getsize(downloaded)
+                logging.info(
+                    "Downloaded media path=%s size=%s bytes",
+                    self._safe_log_path(downloaded),
+                    size,
+                )
+                if self._is_valid_media_file(downloaded, expected_size):
+                    break
+                logging.warning(
+                    "Downloaded media failed validation, retrying: %s",
+                    self._safe_log_path(downloaded),
+                )
+                try:
+                    os.remove(downloaded)
+                except OSError:
+                    pass
+        if not self._is_valid_media_file(downloaded, expected_size):
+            raise FileNotFoundError("Failed to download a valid media file.")
+        self.new_file = downloaded
+        logging.info("Prepared temp media file=%s", self._safe_log_path(self.new_file))
+        # Keep downloaded blobs in temp so future forwards can reuse them.
+        self.cleanup = False
+        return self.new_file
 
     def guess_file_type(self) -> FileType:
         for i in FileType:

@@ -7,7 +7,9 @@ import logging
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
 
+
 def main():
+    process = None
     try:
         # 添加项目目录到Python路径
         project_dir = os.path.abspath(os.path.dirname(__file__))
@@ -52,6 +54,16 @@ def main():
         if process.returncode != 0:
             logger.error(f'Streamlit退出代码: {process.returncode}')
             sys.exit(process.returncode)
+
+    except KeyboardInterrupt:
+        logger.info('收到中断信号，正在关闭Streamlit...')
+        if process and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        return
 
     except Exception as e:
         logger.error(f'运行web UI时出错: {e}')

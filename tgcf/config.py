@@ -40,6 +40,13 @@ class LiveSettings(BaseModel):
     sequential_updates: bool = False
     delete_sync: bool = False
     delete_on_edit: Optional[str] = ".deleteMe"
+    album_debounce_ms: int = 1000
+    album_atomic: bool = True
+    forward_fallback_to_reupload: bool = True
+    retry_on_429: bool = True
+    retry_backoff_base_seconds: int = 1
+    retry_max_attempts_for_non_429: int = 3
+    retry_max_attempts_for_flood_wait: int = 10
 
 
 class PastSettings(BaseModel):
@@ -195,6 +202,10 @@ async def load_from_to(
     from_to_dict = {}
 
     async def _(peer):
+        # Keep numeric IDs untouched (e.g. -100... channel IDs).
+        # Passing raw ints through get_peer_id can strip the channel mark.
+        if isinstance(peer, int):
+            return peer
         return await get_id(client, peer)
 
     for forward in forwards:

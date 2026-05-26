@@ -13,13 +13,10 @@ hide_st(st)
 switch_theme(st,CONFIG)
 st.write("# Welcome to tgcf 👋")
 
-html = """
-<p align="center">
-<img src = "https://user-images.githubusercontent.com/66209958/115183360-3fa4d500-a0f9-11eb-9c0f-c5ed03a9ae17.png" alt = "tgcf logo"  width=120>
-</p>
-"""
-
-st.components.v1.html(html, width=None, height=None, scrolling=False)
+logo_url = "https://user-images.githubusercontent.com/66209958/115183360-3fa4d500-a0f9-11eb-9c0f-c5ed03a9ae17.png"
+left, center, right = st.columns([1, 1, 1])
+with center:
+    st.iframe(logo_url, width=140, height=140)
 with st.expander("Features"):
     st.markdown(
         """
