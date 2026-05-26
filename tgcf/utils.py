@@ -14,10 +14,58 @@ from telethon.tl.custom.message import Message
 
 from tgcf import __version__
 from tgcf.config import CONFIG
+from tgcf.fast_transfer import upload_file as fast_upload_file
 from tgcf.plugin_models import STYLE_CODES
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 TEMP_DIR = os.path.join(BASE_DIR, "temp")
+FAST_SEND_FILE_PART_SIZE_KB = 1024
+
+
+async def _send_file_fast_compatible(client: TelegramClient, *args, **kwargs):
+    if args and len(args) >= 2:
+        recipient = args[0]
+        file = args[1]
+        configured_part_size = int(getattr(CONFIG.live, "transfer_part_size_kb", FAST_SEND_FILE_PART_SIZE_KB) or FAST_SEND_FILE_PART_SIZE_KB)
+        configured_part_size = max(64, min(configured_part_size, 4096))
+        part_size_kb = kwargs.pop("part_size_kb", configured_part_size)
+        configured_connections = int(getattr(CONFIG.live, "transfer_connection_count", 8) or 8)
+        connection_count = max(1, min(configured_connections, 20))
+        progress_callback = kwargs.pop("progress_callback", None)
+
+        async def _prepare(item):
+            if isinstance(item, (str, os.PathLike)) and os.path.exists(item):
+                return await fast_upload_file(
+                    client,
+                    item,
+                    progress_callback=progress_callback,
+                    part_size_kb=part_size_kb,
+                    connection_count=connection_count,
+                )
+            if getattr(item, "read", None):
+                return await fast_upload_file(
+                    client,
+                    item,
+                    progress_callback=progress_callback,
+                    part_size_kb=part_size_kb,
+                    connection_count=connection_count,
+                )
+            return item
+
+        if isinstance(file, (list, tuple)):
+            file = [await _prepare(item) for item in file]
+        else:
+            file = await _prepare(file)
+
+        return await client.send_file(recipient, file, *args[2:], **kwargs)
+
+    try:
+        return await client.send_file(*args, **kwargs)
+    except TypeError as err:
+        if "part_size_kb" not in str(err):
+            raise
+        kwargs.pop("part_size_kb", None)
+        return await client.send_file(*args, **kwargs)
 
 if TYPE_CHECKING:
     from tgcf.plugins import TgcfMessage
@@ -43,8 +91,13 @@ async def send_message(recipient: EntityLike, tm: "TgcfMessage") -> Message:
     if CONFIG.show_forwarded_from:
         return await client.forward_messages(recipient, tm.message)
     if tm.new_file:
-        message = await client.send_file(
-            recipient, tm.new_file, caption=tm.text, reply_to=tm.reply_to
+        message = await _send_file_fast_compatible(
+            client,
+            recipient,
+            tm.new_file,
+            caption=tm.text,
+            reply_to=tm.reply_to,
+            part_size_kb=FAST_SEND_FILE_PART_SIZE_KB,
         )
         return message
     tm.message.text = tm.text

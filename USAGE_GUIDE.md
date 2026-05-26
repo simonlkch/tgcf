@@ -37,7 +37,7 @@ Choose your preferred method:
 ## Installation
 
 ### Prerequisites
-- Python 3.8 or higher
+- Python 3.13
 - Poetry (for dependency management)
 - Git (optional)
 

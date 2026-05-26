@@ -60,7 +60,7 @@ Extremely easy to get started yet ready for any complex task you throw at it.
 
 If you want to use tgcf for free, then run on your own desktop or mobile computer.
 
-Make sure you are on a supported environment and have python:3.10 or above, installed.
+Make sure you are on a supported environment and have python:3.13 installed.
 
 - Create a directory and move into it.
 

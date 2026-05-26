@@ -47,6 +47,8 @@ class LiveSettings(BaseModel):
     retry_backoff_base_seconds: int = 1
     retry_max_attempts_for_non_429: int = 3
     retry_max_attempts_for_flood_wait: int = 10
+    transfer_connection_count: int = 8
+    transfer_part_size_kb: int = 1024
 
 
 class PastSettings(BaseModel):

@@ -2,7 +2,10 @@
 REM tgcf CLI batch script for Windows
 
 REM Activate virtual environment if it exists
-if exist .venv\Scripts\activate.bat (
+if exist .venv313\Scripts\activate.bat (
+    call .venv313\Scripts\activate.bat
+    echo Python 3.13 virtual environment activated
+) else if exist .venv\Scripts\activate.bat (
     call .venv\Scripts\activate.bat
     echo Virtual environment activated
 )
@@ -44,7 +47,10 @@ if "%1"=="run-past-verbose" goto run_past_verbose
     goto end
 
 :end
-    if exist .venv\Scripts\deactivate.bat (
+    if exist .venv313\Scripts\deactivate.bat (
+        call .venv313\Scripts\deactivate.bat
+        echo Python 3.13 virtual environment deactivated
+    ) else if exist .venv\Scripts\deactivate.bat (
         call .venv\Scripts\deactivate.bat
         echo Virtual environment deactivated
     )

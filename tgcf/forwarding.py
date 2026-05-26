@@ -10,12 +10,14 @@ from telethon import TelegramClient
 from telethon.tl.custom.message import Message
 
 from tgcf.plugin_models import FileType
+from tgcf.utils import _send_file_fast_compatible
 
 
 ALBUM_DEBOUNCE_MS = 1000
 MAX_NON_429_RETRIES = 3
 BACKOFF_BASE_SECONDS = 1
 MAX_FLOOD_WAIT_RETRIES = 10
+FAST_SEND_FILE_PART_SIZE_KB = 1024
 FORWARD_RESTRICTED_PAIRS = set()
 
 
@@ -26,8 +28,11 @@ def _preview_text(text: Optional[str], limit: int = 120) -> str:
     if not clean:
         return "(no text/caption)"
     if len(clean) <= limit:
-        return clean
-    return clean[: limit - 3] + "..."
+        preview = clean
+    else:
+        preview = clean[: limit - 3] + "..."
+
+    return preview.encode("ascii", errors="backslashreplace").decode("ascii")
 
 
 def _message_preview(message: Message) -> str:
@@ -437,11 +442,13 @@ async def send_batch(
                         recipient,
                         _preview_text(tm.text),
                     )
-                    sent = await client.send_file(
+                    sent = await _send_file_fast_compatible(
+                        client,
                         recipient,
                         file_path,
                         caption=tm.text,
                         reply_to=reply_to,
+                        part_size_kb=CONFIG.live.transfer_part_size_kb,
                     )
                     logging.info(
                         "send_file fallback succeeded: recipient=%s file=%s caption=%s",
@@ -483,11 +490,13 @@ async def send_batch(
                 recipient,
                 len(file_paths),
             )
-            uploaded = await client.send_file(
+            uploaded = await _send_file_fast_compatible(
+                client,
                 recipient,
                 file_paths,
                 caption=captions,
                 reply_to=reply_to,
+                part_size_kb=CONFIG.live.transfer_part_size_kb,
             )
             if isinstance(uploaded, list):
                 return uploaded

@@ -18,10 +18,15 @@ from hachoir.metadata import extractMetadata
 from hachoir.parser import createParser
 from telethon.tl.custom.message import Message
 from tqdm import tqdm
-
 from tgcf.config import CONFIG
+from tgcf.fast_transfer import download_file
 from tgcf.plugin_models import FileType, ASYNC_PLUGIN_IDS
 from tgcf.utils import cleanup, get_temp_dir, safe_name
+
+
+TRANSFER_PART_SIZE_KB = 1024
+PROGRESS_MIN_UPDATE_SECONDS = 0.25
+PROGRESS_MIN_UPDATE_BYTES = 1024 * 1024
 
 PLUGINS = CONFIG.plugins
 
@@ -112,7 +117,10 @@ class TgcfMessage:
             raise FileNotFoundError("No file exists in this message.")
         downloaded = None
         temp_dir = get_temp_dir()
-        part_size_kb = 512
+        configured_part_size = int(getattr(CONFIG.live, "transfer_part_size_kb", TRANSFER_PART_SIZE_KB) or TRANSFER_PART_SIZE_KB)
+        part_size_kb = max(64, min(configured_part_size, 4096))
+        configured_connections = int(getattr(CONFIG.live, "transfer_connection_count", 8) or 8)
+        connection_count = max(1, min(configured_connections, 20))
         file_meta = getattr(self.message, "file", None)
         expected_size = getattr(file_meta, "size", None)
         file_name = getattr(file_meta, "name", None)
@@ -243,25 +251,61 @@ class TgcfMessage:
         for attempt in range(1, 4):
             progress_bar = None
             downloaded_bytes = 0
+            last_draw_bytes = 0
+            start_time = time.time()
+            last_draw_time = start_time
             downloaded = None
 
             def progress_callback(current: int, total: int):
-                nonlocal progress_bar, downloaded_bytes
+                nonlocal downloaded_bytes, last_draw_bytes, start_time, last_draw_time, progress_bar
                 if progress_bar is None:
                     progress_bar = tqdm(
                         total=total or None,
+                        initial=downloaded_bytes,
                         unit="B",
                         unit_scale=True,
                         unit_divisor=1024,
                         desc=f"download msg {getattr(self.message, 'id', None)}",
-                        leave=False,
+                        mininterval=PROGRESS_MIN_UPDATE_SECONDS,
+                        smoothing=0.1,
+                        leave=True,
                     )
                 if total and progress_bar.total != total:
                     progress_bar.total = total
                 delta = current - downloaded_bytes
                 if delta > 0:
-                    progress_bar.update(delta)
                     downloaded_bytes = current
+
+                now = time.time()
+                should_draw = (
+                    (downloaded_bytes - last_draw_bytes) >= PROGRESS_MIN_UPDATE_BYTES
+                    or (now - last_draw_time) >= PROGRESS_MIN_UPDATE_SECONDS
+                    or (total and downloaded_bytes >= total)
+                )
+                if not should_draw:
+                    return
+
+                draw_delta = downloaded_bytes - last_draw_bytes
+                if draw_delta > 0:
+                    progress_bar.update(draw_delta)
+
+                elapsed = max(now - start_time, 1e-6)
+                speed_bps = downloaded_bytes / elapsed
+                speed_mbps = speed_bps / (1024 * 1024)
+                if total and speed_bps > 0:
+                    eta_seconds = max(total - downloaded_bytes, 0) / speed_bps
+                    progress_bar.set_postfix_str(
+                        f"{speed_mbps:.2f} MB/s | ETA {eta_seconds:.1f}s",
+                        refresh=False,
+                    )
+                else:
+                    progress_bar.set_postfix_str(
+                        f"{speed_mbps:.2f} MB/s",
+                        refresh=False,
+                    )
+
+                last_draw_bytes = downloaded_bytes
+                last_draw_time = now
 
             logging.info(
                 "Downloading media for message_id=%s sender_id=%s into temp directory (attempt %s)",
@@ -286,32 +330,21 @@ class TgcfMessage:
 
                     with open(part_path, mode) as fp:
                         current = resume_from
-                        if progress_bar is None:
-                            progress_bar = tqdm(
-                                total=expected_size or None,
-                                initial=resume_from,
-                                unit="B",
-                                unit_scale=True,
-                                unit_divisor=1024,
-                                desc=f"download msg {getattr(self.message, 'id', None)}",
-                                leave=False,
-                            )
                         downloaded_bytes = resume_from
+                        last_draw_bytes = resume_from
+                        start_time = time.time()
+                        last_draw_time = start_time
 
-                        async for chunk in self.client.iter_download(
+                        await download_file(
+                            self.client,
                             document,
-                            offset=resume_from,
-                            chunk_size=part_size_kb * 1024,
-                            request_size=part_size_kb * 1024,
+                            fp,
+                            progress_callback=progress_callback,
                             file_size=expected_size,
-                        ):
-                            if not chunk:
-                                continue
-                            fp.write(chunk)
-                            current += len(chunk)
-                            progress_callback(current, expected_size or current)
-                            if current % (1024 * 1024) == 0:
-                                _write_resume_meta(current)
+                            part_size_kb=part_size_kb,
+                            connection_count=connection_count,
+                            offset=resume_from,
+                        )
 
                     _write_resume_meta(os.path.getsize(part_path))
                     if expected_size is not None and os.path.getsize(part_path) != expected_size:
@@ -367,6 +400,9 @@ class TgcfMessage:
                 raise
             finally:
                 if progress_bar is not None:
+                    remaining = downloaded_bytes - last_draw_bytes
+                    if remaining > 0:
+                        progress_bar.update(remaining)
                     progress_bar.close()
             if downloaded and os.path.exists(downloaded):
                 size = os.path.getsize(downloaded)
