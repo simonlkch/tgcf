@@ -6,7 +6,7 @@ import yaml
 from tgcf.config import CONFIG, read_config, write_config
 from tgcf.plugin_models import FileType, Replace, Style
 from tgcf.web_ui.password import check_password
-from tgcf.web_ui.utils import get_list, get_string, hide_st, switch_theme
+from tgcf.web_ui.utils import apply_page_chrome, get_list, get_string, hide_st, switch_theme
 
 CONFIG = read_config()
 
@@ -18,6 +18,13 @@ st.set_page_config(
 hide_st(st)
 switch_theme(st,CONFIG)
 if check_password(st):
+    apply_page_chrome(
+        st,
+        CONFIG,
+        "Plugins",
+        "Enable and tune message transformation plugins per forwarding pipeline.",
+        chips=["Filter", "Format", "Replace", "Caption", "OCR"],
+    )
 
     with st.expander("Filter"):
         CONFIG.plugins.filter.check = st.checkbox(

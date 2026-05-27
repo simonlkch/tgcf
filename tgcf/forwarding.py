@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+import time
 from typing import Iterable, List, Optional
 
 from telethon import TelegramClient
 from telethon.tl.custom.message import Message
 
+from tgcf.logging_utils import log_event
 from tgcf.plugin_models import FileType
 from tgcf.utils import _send_file_fast_compatible
 
@@ -19,6 +21,7 @@ BACKOFF_BASE_SECONDS = 1
 MAX_FLOOD_WAIT_RETRIES = 10
 FAST_SEND_FILE_PART_SIZE_KB = 1024
 FORWARD_RESTRICTED_PAIRS = set()
+LOGGER = logging.getLogger(__name__)
 
 
 def _preview_text(text: Optional[str], limit: int = 120) -> str:
@@ -167,22 +170,34 @@ async def forward_source_batch(messages: List[Message], destinations: List[int])
     from tgcf.config import CONFIG
 
     if not messages or not destinations:
-        logging.info("forward_source_batch skipped: messages=%s destinations=%s", bool(messages), bool(destinations))
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "forward_source_batch",
+            outcome="skipped",
+            messages_present=bool(messages),
+            destinations_present=bool(destinations),
+        )
         return
 
     ordered_messages = sorted(messages, key=lambda message: message.id)
     source_chat_id = ordered_messages[0].chat_id
     grouped_id = getattr(ordered_messages[0], "grouped_id", None)
     album_uid = st.album_key(source_chat_id, grouped_id)
-    logging.info(
-        "forward_source_batch start: source_chat=%s grouped_id=%s message_count=%s destination_count=%s",
-        source_chat_id,
-        grouped_id,
-        len(ordered_messages),
-        len(destinations),
-    )
-
     for dest in destinations:
+        start_ts = time.perf_counter()
+        wide_event = {
+            "event": "forward_source_batch",
+            "source_chat_id": source_chat_id,
+            "grouped_id": grouped_id,
+            "is_album": grouped_id is not None,
+            "message_count": len(ordered_messages),
+            "destination_count": len(destinations),
+            "destination_chat_id": dest,
+            "first_caption_preview": _message_preview(ordered_messages[0]),
+            "album_atomic": bool(CONFIG.live.album_atomic),
+            "forward_from_enabled": bool(CONFIG.show_forwarded_from),
+        }
         reply_to = None
         updated_event_uids = []
         for source_message in ordered_messages:
@@ -196,30 +211,18 @@ async def forward_source_batch(messages: List[Message], destinations: List[int])
             if previous:
                 reply_to = getattr(previous, "id", None)
                 break
+        wide_event["reply_to_message_id"] = reply_to
 
         sent_messages = []
         try:
-            logging.info(
-                "sending batch: source_chat=%s grouped_id=%s destination=%s message_count=%s reply_to=%s first_caption=%s",
-                source_chat_id,
-                grouped_id,
-                dest,
-                len(ordered_messages),
-                reply_to,
-                _message_preview(ordered_messages[0]),
-            )
             sent_messages = await forward_batch_with_retry(
                 dest,
                 ordered_messages,
                 reply_to=reply_to,
             )
             if not sent_messages:
-                logging.info(
-                    "batch produced no outgoing messages: source_chat=%s destination=%s grouped_id=%s",
-                    source_chat_id,
-                    dest,
-                    grouped_id,
-                )
+                wide_event["outcome"] = "no_outgoing_messages"
+                wide_event["sent_count"] = 0
                 continue
             if not isinstance(sent_messages, list):
                 sent_messages = [sent_messages]
@@ -235,26 +238,21 @@ async def forward_source_batch(messages: List[Message], destinations: List[int])
                     len(ordered_messages),
                     len(sent_messages),
                 )
+                wide_event["message_count_mismatch"] = True
+                wide_event["sent_count"] = len(sent_messages)
+                wide_event["source_count"] = len(ordered_messages)
 
             for source_message, sent_message in zip(ordered_messages, sent_messages):
                 event = st.DummyEvent(source_chat_id, source_message.id)
                 event_uid = st.EventUid(event)
                 st.stored.setdefault(event_uid, {})[dest] = sent_message
                 updated_event_uids.append(event_uid)
-            logging.info(
-                "batch sent successfully: source_chat=%s grouped_id=%s destination=%s sent_count=%s",
-                source_chat_id,
-                grouped_id,
-                dest,
-                len(sent_messages),
-            )
-        except Exception:
-            logging.exception(
-                "batch failed: source_chat=%s grouped_id=%s destination=%s",
-                source_chat_id,
-                grouped_id,
-                dest,
-            )
+            wide_event["outcome"] = "success"
+            wide_event["sent_count"] = len(sent_messages)
+        except Exception as err:
+            wide_event["outcome"] = "error"
+            wide_event["error_type"] = type(err).__name__
+            wide_event["error_message"] = str(err)
             if CONFIG.live.album_atomic:
                 for sent_message in sent_messages:
                     try:
@@ -274,6 +272,14 @@ async def forward_source_batch(messages: List[Message], destinations: List[int])
                         if not stored_for_album:
                             del st.stored_albums[album_uid]
             raise
+        finally:
+            wide_event["duration_ms"] = round((time.perf_counter() - start_ts) * 1000, 2)
+            log_event(
+                LOGGER,
+                logging.ERROR if wide_event.get("outcome") == "error" else logging.INFO,
+                wide_event.pop("event", "forward_source_batch"),
+                **wide_event,
+            )
 
 
 async def forward_batch_with_retry(

@@ -17,6 +17,7 @@ todo
 *.txt
 *.ipynb
 .playwright-mcp/
+.github/skills/
 
 # Git
 .git

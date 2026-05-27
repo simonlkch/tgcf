@@ -7,7 +7,7 @@ import streamlit as st
 from tgcf.config import CONFIG_FILE_NAME, Config, read_config, write_config
 from tgcf.utils import platform_info
 from tgcf.web_ui.password import check_password
-from tgcf.web_ui.utils import hide_st, switch_theme
+from tgcf.web_ui.utils import apply_page_chrome, hide_st, switch_theme
 
 CONFIG = read_config()
 
@@ -19,6 +19,13 @@ hide_st(st)
 switch_theme(st,CONFIG)
 
 if check_password(st):
+    apply_page_chrome(
+        st,
+        CONFIG,
+        "Advanced",
+        "Developer tools, config backup/restore, and low-level live mode controls.",
+        chips=["Developer Mode", "Config Backups", "Live Tuning"],
+    )
 
     st.warning("This page is for developers and advanced users.")
     if st.checkbox("I agree"):

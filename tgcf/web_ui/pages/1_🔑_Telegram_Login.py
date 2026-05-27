@@ -1,10 +1,12 @@
 import asyncio
+import json
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 from tgcf.config import CONFIG, SessionEntry, read_config, write_config
 from tgcf.web_ui.password import check_password
-from tgcf.web_ui.utils import hide_st, switch_theme
+from tgcf.web_ui.utils import apply_page_chrome, hide_st, switch_theme
 
 CONFIG = read_config()
 
@@ -94,11 +96,36 @@ async def _sign_in_with_2fa(api_id: int, api_hash: str, session_data: str, passw
     return session_string
 
 
+def _render_copy_button(text: str, key: str) -> None:
+    """Render a browser-side copy button for a session string."""
+
+    payload = json.dumps(text)
+    elem_id = f"copy_status_{key}"
+    components.html(
+        f"""
+        <button
+            style=\"padding:0.35rem 0.8rem;border-radius:0.4rem;border:1px solid #aaa;cursor:pointer;\"
+            onclick=\"navigator.clipboard.writeText({payload}).then(() => {{document.getElementById('{elem_id}').innerText='Copied';}}).catch(() => {{document.getElementById('{elem_id}').innerText='Copy failed';}});\"
+        >Copy Session String</button>
+        <span id=\"{elem_id}\" style=\"margin-left:0.6rem;font-size:0.9rem;\"></span>
+        """,
+        height=42,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Page UI
 # ---------------------------------------------------------------------------
 
 if check_password(st):
+    apply_page_chrome(
+        st,
+        CONFIG,
+        "Telegram Login",
+        "Manage bot/user auth and multi-session storage with inline session generation.",
+        chips=["Secure Inputs", "Multi Session", "Telethon"],
+    )
+
     CONFIG.login.API_ID = int(
         st.text_input("API ID", value=str(CONFIG.login.API_ID), type="password")
     )
@@ -316,15 +343,28 @@ if check_password(st):
                         None,
                     )
                     if existing_idx is None:
-                        CONFIG.login.sessions.append(SessionEntry(name="", session_string=session_string))
+                        default_name = (
+                            st.session_state.get("tl_sg_phone", "").strip()
+                            or f"Session {len(CONFIG.login.sessions) + 1}"
+                        )
+                        CONFIG.login.sessions.append(
+                            SessionEntry(name=default_name, session_string=session_string)
+                        )
                         existing_idx = len(CONFIG.login.sessions) - 1
 
                     CONFIG.login.active_session = existing_idx
                     write_config(CONFIG)
                     st.session_state.tl_sg_saved_index = existing_idx
+                    if 0 <= existing_idx < len(CONFIG.login.sessions):
+                        st.session_state[f"sess_name_{existing_idx}"] = (
+                            CONFIG.login.sessions[existing_idx].name
+                        )
                     st.session_state.tl_sg_persisted = True
 
                 st.success("✅ Login successful! Session saved to config.")
+                st.write("### Session String")
+                st.code(session_string, language=None)
+                _render_copy_button(session_string, "tl_sg_session")
                 saved_index = st.session_state.get("tl_sg_saved_index", CONFIG.login.active_session)
                 current_name = ""
                 if 0 <= saved_index < len(CONFIG.login.sessions):
@@ -340,6 +380,7 @@ if check_password(st):
                     if 0 <= saved_index < len(CONFIG.login.sessions):
                         CONFIG.login.sessions[saved_index].name = name
                         write_config(CONFIG)
+                        st.session_state[f"sess_name_{saved_index}"] = name
                     for k in ["tl_sg_state", "tl_sg_api_id", "tl_sg_api_hash",
                               "tl_sg_session_data", "tl_sg_phone", "tl_sg_hash",
                               "tl_sg_session", "tl_sg_error", "tl_sg_new_name",

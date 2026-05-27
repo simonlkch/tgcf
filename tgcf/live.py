@@ -13,12 +13,14 @@ from tgcf import storage as st
 from tgcf.bot import get_events
 from tgcf.config import CONFIG, get_SESSION
 from tgcf.forwarding import forward_source_batch
+from tgcf.logging_utils import log_event
 from tgcf.plugins import apply_plugins, load_async_plugins
 from tgcf.utils import clean_session_files
 
 
 album_buffers: Dict[Tuple[int, int], List[Message]] = {}
 album_tasks: Dict[Tuple[int, int], asyncio.Task] = {}
+LOGGER = logging.getLogger(__name__)
 
 
 async def _flush_album_later(album_uid: Tuple[int, int]) -> None:
@@ -32,7 +34,14 @@ async def _flush_album_later(album_uid: Tuple[int, int]) -> None:
     except asyncio.CancelledError:
         return
     except Exception as err:
-        logging.exception(err)
+        LOGGER.exception(
+            {
+                "event": "album_flush_failed",
+                "album_uid": str(album_uid),
+                "error_type": type(err).__name__,
+                "error_message": str(err),
+            }
+        )
 
 
 async def _queue_album_message(message: Message) -> None:
@@ -63,7 +72,14 @@ async def new_message_handler(event: Union[Message, events.NewMessage]) -> None:
 
     if chat_id not in config.from_to:
         return
-    logging.info(f"New message received in {chat_id}")
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "live_new_message_received",
+        source_chat_id=chat_id,
+        message_id=getattr(event.message, "id", None),
+        grouped_id=getattr(event.message, "grouped_id", None),
+    )
     message = event.message
 
     length = len(st.stored)
@@ -90,7 +106,13 @@ async def edited_message_handler(event) -> None:
     if chat_id not in config.from_to:
         return
 
-    logging.info(f"Message edited in {chat_id}")
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "live_message_edited",
+        source_chat_id=chat_id,
+        message_id=getattr(message, "id", None),
+    )
 
     event_uid = st.EventUid(event)
     fwded_msgs = st.stored.get(event_uid)
@@ -119,7 +141,12 @@ async def deleted_message_handler(event):
     if chat_id not in config.from_to:
         return
 
-    logging.info(f"Message deleted in {chat_id}")
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "live_message_deleted",
+        source_chat_id=chat_id,
+    )
 
     event_uid = st.EventUid(event)
     fwded_msgs = st.stored.get(event_uid)
@@ -153,13 +180,18 @@ async def start_sync() -> None:
     )
     if CONFIG.login.user_type == 0:
         if CONFIG.login.BOT_TOKEN == "":
-            logging.warning("Bot token not found, but login type is set to bot.")
+            log_event(
+                LOGGER,
+                logging.WARNING,
+                "bot_token_missing",
+                outcome="aborted",
+            )
             sys.exit()
         await client.start(bot_token=CONFIG.login.BOT_TOKEN)
     else:
         await client.start()
     config.is_bot = await client.is_bot()
-    logging.info(f"config.is_bot={config.is_bot}")
+    log_event(LOGGER, logging.INFO, "live_client_started", is_bot=config.is_bot)
     command_events = get_events()
 
     await config.load_admins(client)
@@ -170,7 +202,7 @@ async def start_sync() -> None:
         if config.CONFIG.live.delete_sync is False and key == "deleted":
             continue
         client.add_event_handler(*val)
-        logging.info(f"Added event handler for {key}")
+        log_event(LOGGER, logging.INFO, "event_handler_registered", handler=key)
 
     if config.is_bot and const.REGISTER_COMMANDS:
         await client(

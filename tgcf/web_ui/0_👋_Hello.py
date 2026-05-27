@@ -1,6 +1,6 @@
 import streamlit as st
 
-from tgcf.web_ui.utils import hide_st, switch_theme
+from tgcf.web_ui.utils import apply_page_chrome, hide_st, switch_theme
 from tgcf.config import read_config
 
 CONFIG = read_config()
@@ -11,13 +11,19 @@ st.set_page_config(
 )
 hide_st(st)
 switch_theme(st,CONFIG)
-st.write("# Welcome to tgcf 👋")
+apply_page_chrome(
+    st,
+    CONFIG,
+    "Welcome to tgcf",
+    "Fast Telegram forwarding automation with rich controls and plugin support.",
+    chips=["Web UI", "Beginner Friendly", "Config Driven"],
+)
 
 logo_url = "https://user-images.githubusercontent.com/66209958/115183360-3fa4d500-a0f9-11eb-9c0f-c5ed03a9ae17.png"
 left, center, right = st.columns([1, 1, 1])
 with center:
     st.iframe(logo_url, width=140, height=140)
-with st.expander("Features"):
+with st.expander("Features", expanded=True):
     st.markdown(
         """
     tgcf is the ultimate tool to automate custom telegram message forwarding.

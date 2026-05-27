@@ -6,6 +6,7 @@
 
 import asyncio
 import logging
+import time
 
 from telethon import TelegramClient
 from telethon.errors.rpcerrorlist import FloodWaitError
@@ -15,21 +16,27 @@ from telethon.tl.patched import MessageService
 from tgcf import config
 from tgcf.config import CONFIG, get_SESSION, write_config
 from tgcf.forwarding import build_forward_batches, forward_source_batch
+from tgcf.logging_utils import log_event
 from tgcf.plugins import load_async_plugins
 from tgcf.utils import clean_session_files
 
 
 async def forward_job() -> None:
     """Forward all existing messages in the concerned chats."""
-    logging.info("past forward_job started")
+    logger = logging.getLogger(__name__)
+    job_start = time.perf_counter()
+    log_event(logger, logging.INFO, "past_forward_job_started")
     clean_session_files()
 
     # load async plugins defined in plugin_models
     await load_async_plugins()
 
     if CONFIG.login.user_type != 1:
-        logging.warning(
-            "You cannot use bot account for tgcf past mode. Telegram does not allow bots to access chat history."
+        log_event(
+            logger,
+            logging.WARNING,
+            "past_mode_requires_user_account",
+            outcome="skipped",
         )
         return
     SESSION = get_SESSION()
@@ -64,18 +71,22 @@ async def forward_job() -> None:
                 and int(forward.offset) == int(forward.end)
             )
             forward: config.Forward
-            logging.info(
-                "Forwarding messages from %s to %s (offset=%s, end=%s)",
-                src,
-                dest,
-                forward.offset,
-                forward.end,
+            source_event = {
+                "event": "past_source_scan",
+                "source_chat_id": src,
+                "destination_count": len(dest),
+                "offset": forward.offset,
+                "end": forward.end,
             )
+            source_start = time.perf_counter()
+            log_event(logger, logging.INFO, "past_source_scan_started", **source_event)
             if exact_id_mode:
-                logging.info(
-                    "Exact-id mode enabled for source=%s id=%s",
-                    src,
-                    forward.offset,
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "past_exact_id_mode_enabled",
+                    source_chat_id=src,
+                    message_id=forward.offset,
                 )
 
             current_batch = []
@@ -87,11 +98,23 @@ async def forward_job() -> None:
                 for batch in build_forward_batches(current_batch):
                     await forward_source_batch(batch.messages, dest)
                     last_id = batch.messages[-1].id
-                    logging.info(f"forwarding message with id = {last_id}")
+                    log_event(
+                        logger,
+                        logging.INFO,
+                        "past_batch_forwarded",
+                        source_chat_id=src,
+                        last_forwarded_id=last_id,
+                        batch_size=len(batch.messages),
+                    )
                     forward.offset = last_id
                     write_config(CONFIG, persist=False)
                     await asyncio.sleep(CONFIG.past.delay)
-                    logging.info(f"slept for {CONFIG.past.delay} seconds")
+                    log_event(
+                        logger,
+                        logging.INFO,
+                        "past_delay_applied",
+                        delay_seconds=CONFIG.past.delay,
+                    )
                 current_batch = []
 
             async def handle_message(message: Message):
@@ -99,12 +122,14 @@ async def forward_job() -> None:
                 scanned_count += 1
 
                 if scanned_count % 200 == 0:
-                    logging.info(
-                        "Scanning progress for %s: scanned=%s accepted=%s last_forwarded_id=%s",
-                        src,
-                        scanned_count,
-                        accepted_count,
-                        last_id,
+                    log_event(
+                        logger,
+                        logging.INFO,
+                        "past_scan_progress",
+                        source_chat_id=src,
+                        scanned_count=scanned_count,
+                        accepted_count=accepted_count,
+                        last_forwarded_id=last_id,
                     )
 
                 if forward.end and message.id > forward.end:
@@ -128,10 +153,24 @@ async def forward_job() -> None:
                     if message:
                         await handle_message(message)
                 except FloodWaitError as fwe:
-                    logging.info(f"Sleeping for {fwe}")
+                    log_event(
+                        logger,
+                        logging.WARNING,
+                        "past_flood_wait",
+                        source_chat_id=src,
+                        wait_seconds=fwe.seconds,
+                        mode="exact_id",
+                    )
                     await asyncio.sleep(delay=fwe.seconds)
                 except Exception as err:
-                    logging.exception(err)
+                    logger.exception(
+                        {
+                            "event": "past_exact_id_forward_failed",
+                            "source_chat_id": src,
+                            "error_type": type(err).__name__,
+                            "error_message": str(err),
+                        }
+                    )
             else:
                 async for message in client.iter_messages(
                     src, reverse=True, offset_id=forward.offset
@@ -140,26 +179,60 @@ async def forward_job() -> None:
                     try:
                         await handle_message(message)
                     except FloodWaitError as fwe:
-                        logging.info(f"Sleeping for {fwe}")
+                        log_event(
+                            logger,
+                            logging.WARNING,
+                            "past_flood_wait",
+                            source_chat_id=src,
+                            wait_seconds=fwe.seconds,
+                            mode="iter_messages",
+                        )
                         await asyncio.sleep(delay=fwe.seconds)
                     except Exception as err:
-                        logging.exception(err)
+                        logger.exception(
+                            {
+                                "event": "past_iter_forward_failed",
+                                "source_chat_id": src,
+                                "error_type": type(err).__name__,
+                                "error_message": str(err),
+                            }
+                        )
 
             try:
                 await flush_batch()
-                logging.info(
-                    "Completed source %s: scanned=%s accepted=%s last_forwarded_id=%s",
-                    src,
-                    scanned_count,
-                    accepted_count,
-                    last_id,
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "past_source_scan_completed",
+                    source_chat_id=src,
+                    scanned_count=scanned_count,
+                    accepted_count=accepted_count,
+                    last_forwarded_id=last_id,
+                    duration_ms=round((time.perf_counter() - source_start) * 1000, 2),
                 )
                 if accepted_count == 0:
-                    logging.warning(
-                        "No eligible messages found for source=%s with offset=%s end=%s",
-                        src,
-                        forward.offset,
-                        forward.end,
+                    log_event(
+                        logger,
+                        logging.WARNING,
+                        "past_no_eligible_messages",
+                        source_chat_id=src,
+                        offset=forward.offset,
+                        end=forward.end,
                     )
             except Exception as err:
-                logging.exception(err)
+                logger.exception(
+                    {
+                        "event": "past_source_scan_failed",
+                        "source_chat_id": src,
+                        "error_type": type(err).__name__,
+                        "error_message": str(err),
+                        "duration_ms": round((time.perf_counter() - source_start) * 1000, 2),
+                    }
+                )
+
+    log_event(
+        logger,
+        logging.INFO,
+        "past_forward_job_completed",
+        duration_ms=round((time.perf_counter() - job_start) * 1000, 2),
+    )

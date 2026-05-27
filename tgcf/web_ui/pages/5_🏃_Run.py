@@ -9,7 +9,7 @@ import streamlit as st
 
 from tgcf.config import CONFIG, read_config, write_config
 from tgcf.web_ui.password import check_password
-from tgcf.web_ui.utils import hide_st, switch_theme
+from tgcf.web_ui.utils import apply_page_chrome, hide_st, switch_theme
 
 CONFIG = read_config()
 
@@ -101,6 +101,14 @@ st.set_page_config(
 hide_st(st)
 switch_theme(st,CONFIG)
 if check_password(st):
+    apply_page_chrome(
+        st,
+        CONFIG,
+        "Run Control",
+        "Launch, monitor, and troubleshoot live or past forwarding execution.",
+        chips=["Runtime", "Logs", "Health"],
+    )
+
     with st.expander("Current Runtime Summary", expanded=True):
         st.write(f"**Mode:** {'past' if CONFIG.mode == 1 else 'live'}")
         st.write(f"**Show Forwarded from:** {'Yes' if CONFIG.show_forwarded_from else 'No'}")

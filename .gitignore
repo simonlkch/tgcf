@@ -134,6 +134,7 @@ env.bak/
 venv.bak/
 .venv313/
 .venv314/
+.github/skills/
 
 # Spyder project settings
 .spyderproject

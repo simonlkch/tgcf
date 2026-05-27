@@ -5,12 +5,14 @@ then generates a Telethon StringSession for use in tgcf's User mode.
 """
 
 import asyncio
+import json
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 from tgcf.config import read_config, write_config
 from tgcf.web_ui.password import check_password
-from tgcf.web_ui.utils import hide_st, switch_theme
+from tgcf.web_ui.utils import apply_page_chrome, hide_st, switch_theme
 
 CONFIG = read_config()
 
@@ -91,12 +93,36 @@ async def _sign_in_with_2fa(api_id: int, api_hash: str, session_data: str, passw
     return session_string
 
 
+def _render_copy_button(text: str, key: str) -> None:
+    """Render a browser-side copy button for a session string."""
+
+    payload = json.dumps(text)
+    elem_id = f"copy_status_{key}"
+    components.html(
+        f"""
+        <button
+            style=\"padding:0.35rem 0.8rem;border-radius:0.4rem;border:1px solid #aaa;cursor:pointer;\"
+            onclick=\"navigator.clipboard.writeText({payload}).then(() => {{document.getElementById('{elem_id}').innerText='Copied';}}).catch(() => {{document.getElementById('{elem_id}').innerText='Copy failed';}});\"
+        >Copy Session String</button>
+        <span id=\"{elem_id}\" style=\"margin-left:0.6rem;font-size:0.9rem;\"></span>
+        """,
+        height=42,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Page UI
 # ---------------------------------------------------------------------------
 
 if check_password(st):
-    st.write("## 🔐 Session String Generator")
+    apply_page_chrome(
+        st,
+        CONFIG,
+        "Session Generator",
+        "Generate and persist Telegram user session strings through OTP/2FA flow.",
+        chips=["OTP Flow", "2FA Support", "Session Export"],
+    )
+
     st.info(
         "Log in with your Telegram account to generate a **Session String**. "
         "This string can then be pasted into the **Telegram Login** page (User mode) — "
@@ -237,6 +263,7 @@ if check_password(st):
         st.success("✅ Login successful! Your session string is ready and saved to config.")
         st.write("### Your Session String")
         st.code(session_string, language=None)
+        _render_copy_button(session_string, "sg_session")
         st.download_button(
             "📥 Download session string",
             data=session_string,

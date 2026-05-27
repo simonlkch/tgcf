@@ -10,10 +10,10 @@ from typing import Optional
 import typer
 from dotenv import load_dotenv
 from rich import console, traceback
-from rich.logging import RichHandler
 from verlat import latest_release
 
 from tgcf import __version__
+from tgcf.logging_utils import log_event, setup_logging
 
 load_dotenv(".env")
 
@@ -43,18 +43,15 @@ def verbosity_callback(value: bool):
         level = logging.INFO
     else:
         level = logging.WARNING
-    logging.basicConfig(
-        level=level,
-        format="%(message)s",
-        handlers=[
-            RichHandler(
-                rich_tracebacks=True,
-                markup=True,
-            )
-        ],
-    )
+    setup_logging(level)
     topper()
-    logging.info("Verbosity turned on! This is suitable for debugging")
+    log_event(
+        logging.getLogger(__name__),
+        logging.INFO,
+        "logging_configured",
+        verbose=bool(value),
+        log_level=logging.getLevelName(level).lower(),
+    )
 
 
 def version_callback(value: bool):
@@ -107,7 +104,13 @@ def main(
     To run web interface run `tgcf-web` command.
     """
     if FAKE:
-        logging.critical(f"You are running fake with {mode} mode")
+        log_event(
+            logging.getLogger(__name__),
+            logging.ERROR,
+            "startup_blocked_fake_mode",
+            mode=mode,
+            outcome="aborted",
+        )
         sys.exit(1)
 
     if mode == Mode.PAST:
