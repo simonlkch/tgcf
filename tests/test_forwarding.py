@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from tgcf import storage as st
+from tgcf.plugin_models import FileType
 from tgcf.forwarding import (
     build_forward_batches,
     forward_source_batch,
@@ -66,10 +67,16 @@ class DummyTgcfMessage:
         self.reply_to = None
         self.file_type = "image"
         self.new_file = None
+        self.thumb_file = None
+        self.ensure_thumb_calls = 0
         self.cleared = False
 
     async def get_file(self):
         return "downloaded.jpg"
+
+    async def ensure_thumb_file(self):
+        self.ensure_thumb_calls += 1
+        return self.thumb_file
 
     def clear(self):
         self.cleared = True
@@ -177,6 +184,55 @@ class ForwardingHelpersTest(unittest.TestCase):
         self.assertEqual(client.sent_file_calls[0][0], 12345)
         self.assertEqual(client.sent_file_calls[0][1], "downloaded.jpg")
         self.assertTrue(tm.cleared)
+
+    def test_send_batch_reupload_uses_thumb_when_available(self):
+        from tgcf.config import CONFIG
+
+        original_forwarded = CONFIG.show_forwarded_from
+        original_fallback = CONFIG.live.forward_fallback_to_reupload
+        CONFIG.show_forwarded_from = False
+        CONFIG.live.forward_fallback_to_reupload = True
+
+        client = DummyClient()
+        tm = DummyTgcfMessage(client)
+        tm.file_type = FileType.VIDEO
+        tm.new_file = "cached_video.mp4"
+        tm.thumb_file = "cached_thumb.jpg"
+
+        class ChatForwardsRestrictedError(Exception):
+            pass
+
+        captured = {}
+
+        async def fake_apply_plugins(_message):
+            return tm
+
+        async def fake_send_message(_recipient, _tm):
+            raise ChatForwardsRestrictedError(
+                "You can't forward messages from a protected chat"
+            )
+
+        async def fake_send_file_fast_compatible(_client, _recipient, _file, **kwargs):
+            captured.update(kwargs)
+            return DummySentMessage(778)
+
+        try:
+            with patch("tgcf.plugins.apply_plugins", side_effect=fake_apply_plugins), patch(
+                "tgcf.utils.send_message", side_effect=fake_send_message
+            ), patch(
+                "tgcf.forwarding._send_file_fast_compatible",
+                side_effect=fake_send_file_fast_compatible,
+            ):
+                import asyncio
+
+                sent = asyncio.run(send_batch(12345, [object()]))
+        finally:
+            CONFIG.show_forwarded_from = original_forwarded
+            CONFIG.live.forward_fallback_to_reupload = original_fallback
+
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(captured.get("thumb"), "cached_thumb.jpg")
+        self.assertEqual(tm.ensure_thumb_calls, 1)
 
 
 if __name__ == "__main__":

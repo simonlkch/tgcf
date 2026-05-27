@@ -131,6 +131,16 @@ class TgcfMessage:
             return downloaded_thumb
         return None
 
+    async def ensure_thumb_file(self) -> str | None:
+        if self.file_type not in (FileType.VIDEO, FileType.VIDEO_NOTE, FileType.GIF):
+            return None
+
+        if self.thumb_file and os.path.exists(self.thumb_file):
+            return self.thumb_file
+
+        self.thumb_file = await self._download_source_thumb(get_temp_dir())
+        return self.thumb_file
+
     def _is_valid_media_file(self, file_path: str, expected_size: int) -> bool:
         if not file_path or not os.path.exists(file_path):
             return False
@@ -247,7 +257,8 @@ class TgcfMessage:
             chosen = max(candidates, key=os.path.getmtime)
             logging.info("Reusing existing temp media=%s", self._safe_log_path(chosen))
             self.new_file = chosen
-            self.cleanup = False
+            await self.ensure_thumb_file()
+            self.cleanup = True
             return self.new_file
 
         if os.path.exists(target_path):
@@ -259,7 +270,8 @@ class TgcfMessage:
                     size,
                 )
                 self.new_file = target_path
-                self.cleanup = False
+                await self.ensure_thumb_file()
+                self.cleanup = True
                 return self.new_file
 
             # Keep partial files for resume instead of always restarting from zero.
@@ -469,9 +481,9 @@ class TgcfMessage:
             raise FileNotFoundError("Failed to download a valid media file.")
         self.new_file = downloaded
         logging.info("Prepared temp media file=%s", self._safe_log_path(self.new_file))
-        self.thumb_file = await self._download_source_thumb(temp_dir)
-        # Keep downloaded blobs in temp so future forwards can reuse them.
-        self.cleanup = False
+        self.thumb_file = await self.ensure_thumb_file()
+        # Remove temp media artifacts after upload to avoid stale temp growth.
+        self.cleanup = True
         return self.new_file
 
     def guess_file_type(self) -> FileType:

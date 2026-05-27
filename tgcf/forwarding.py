@@ -465,6 +465,10 @@ async def send_batch(
                 logging.info("Fallback phase: preparing downloadable media for recipient=%s", recipient)
                 file_path = tm.new_file or await _get_downloaded_file(tm)
                 try:
+                    thumb_file = getattr(tm, "thumb_file", None)
+                    ensure_thumb = getattr(tm, "ensure_thumb_file", None)
+                    if callable(ensure_thumb):
+                        thumb_file = await ensure_thumb()
                     logging.info(
                         "Fallback phase: uploading media file=%s recipient=%s caption=%s",
                         file_path,
@@ -479,7 +483,7 @@ async def send_batch(
                         reply_to=reply_to,
                         part_size_kb=CONFIG.live.transfer_part_size_kb,
                         source_media_type=tm.file_type,
-                        thumb=getattr(tm, "thumb_file", None),
+                        thumb=thumb_file,
                     )
                     logging.info(
                         "send_file fallback succeeded: recipient=%s file=%s caption=%s",

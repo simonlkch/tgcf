@@ -142,6 +142,10 @@ async def send_message(recipient: EntityLike, tm: "TgcfMessage") -> Message:
     if tm.file_type == FileType.PHOTO and tm.new_file:
         return await client.send_file(recipient, tm.new_file, caption=tm.text, reply_to=tm.reply_to)
     if tm.new_file:
+        thumb_file = getattr(tm, "thumb_file", None)
+        ensure_thumb = getattr(tm, "ensure_thumb_file", None)
+        if callable(ensure_thumb):
+            thumb_file = await ensure_thumb()
         message = await _send_file_fast_compatible(
             client,
             recipient,
@@ -150,7 +154,7 @@ async def send_message(recipient: EntityLike, tm: "TgcfMessage") -> Message:
             reply_to=tm.reply_to,
             part_size_kb=FAST_SEND_FILE_PART_SIZE_KB,
             source_media_type=tm.file_type,
-            thumb=getattr(tm, "thumb_file", None),
+            thumb=thumb_file,
         )
         return message
     tm.message.text = tm.text
