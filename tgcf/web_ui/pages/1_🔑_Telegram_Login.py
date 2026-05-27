@@ -126,6 +126,23 @@ if check_password(st):
         chips=["Secure Inputs", "Multi Session", "Telethon"],
     )
 
+    # Backfill missing session names and migrate legacy single-session config.
+    session_entries_updated = False
+    if not CONFIG.login.sessions and CONFIG.login.SESSION_STRING:
+        CONFIG.login.sessions.append(
+            SessionEntry(name="Session 1", session_string=CONFIG.login.SESSION_STRING)
+        )
+        CONFIG.login.active_session = 0
+        session_entries_updated = True
+
+    for idx, sess in enumerate(CONFIG.login.sessions):
+        if not (sess.name or "").strip():
+            CONFIG.login.sessions[idx].name = f"Session {idx + 1}"
+            session_entries_updated = True
+
+    if session_entries_updated:
+        write_config(CONFIG)
+
     CONFIG.login.API_ID = int(
         st.text_input("API ID", value=str(CONFIG.login.API_ID), type="password")
     )
@@ -351,6 +368,8 @@ if check_password(st):
                             SessionEntry(name=default_name, session_string=session_string)
                         )
                         existing_idx = len(CONFIG.login.sessions) - 1
+                    elif not (CONFIG.login.sessions[existing_idx].name or "").strip():
+                        CONFIG.login.sessions[existing_idx].name = f"Session {existing_idx + 1}"
 
                     CONFIG.login.active_session = existing_idx
                     write_config(CONFIG)
@@ -363,7 +382,12 @@ if check_password(st):
 
                 st.success("✅ Login successful! Session saved to config.")
                 st.write("### Session String")
-                st.code(session_string, language=None)
+                st.text_input(
+                    "Session string",
+                    value=session_string,
+                    type="password",
+                    key="tl_sg_session_masked",
+                )
                 _render_copy_button(session_string, "tl_sg_session")
                 saved_index = st.session_state.get("tl_sg_saved_index", CONFIG.login.active_session)
                 current_name = ""
@@ -376,7 +400,9 @@ if check_password(st):
                     key="tl_sg_new_name",
                 )
                 if st.button("💾 Update session name"):
-                    name = st.session_state.get("tl_sg_new_name", "")
+                    name = st.session_state.get("tl_sg_new_name", "").strip()
+                    if not name and 0 <= saved_index < len(CONFIG.login.sessions):
+                        name = f"Session {saved_index + 1}"
                     if 0 <= saved_index < len(CONFIG.login.sessions):
                         CONFIG.login.sessions[saved_index].name = name
                         write_config(CONFIG)
