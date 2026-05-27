@@ -7,6 +7,7 @@ Contains all the first-party tgcf plugins.
 import inspect
 import json
 import logging
+import mimetypes
 import os
 import re
 import time
@@ -39,6 +40,7 @@ class TgcfMessage:
         self.sender_id = self.message.sender_id
         self.file_type = self.guess_file_type()
         self.new_file = None
+        self.thumb_file = None
         self.cleanup = False
         self.reply_to = None
         self.client = self.message.client
@@ -85,6 +87,50 @@ class TgcfMessage:
         safe = safe_name(raw)
         return safe.encode("ascii", errors="backslashreplace").decode("ascii")
 
+    def _suggest_file_name(self) -> str:
+        file_meta = getattr(self.message, "file", None)
+        file_name = getattr(file_meta, "name", None)
+        if file_name:
+            return file_name
+
+        mime_type = getattr(file_meta, "mime_type", None) or ""
+        if self.file_type == FileType.PHOTO:
+            return f"msg_{getattr(self.message, 'id', 'unknown')}.jpg"
+        if self.file_type in (FileType.VIDEO, FileType.VIDEO_NOTE):
+            ext = mimetypes.guess_extension(mime_type) or ".mp4"
+            if ext == ".jpe":
+                ext = ".jpg"
+            return f"msg_{getattr(self.message, 'id', 'unknown')}{ext}"
+        if self.file_type == FileType.AUDIO:
+            ext = mimetypes.guess_extension(mime_type) or ".mp3"
+            if ext == ".jpe":
+                ext = ".jpg"
+            return f"msg_{getattr(self.message, 'id', 'unknown')}{ext}"
+        if self.file_type == FileType.GIF:
+            return f"msg_{getattr(self.message, 'id', 'unknown')}.gif"
+        if self.file_type == FileType.STICKER:
+            return f"msg_{getattr(self.message, 'id', 'unknown')}.webp"
+        return f"msg_{getattr(self.message, 'id', 'unknown')}.bin"
+
+    def _suggest_thumb_name(self) -> str:
+        return f"msg_{getattr(self.message, 'id', 'unknown')}_thumb.jpg"
+
+    async def _download_source_thumb(self, temp_dir: str) -> str | None:
+        if self.file_type not in (FileType.VIDEO, FileType.VIDEO_NOTE, FileType.GIF):
+            return None
+
+        document = getattr(self.message, "document", None)
+        thumbs = getattr(document, "thumbs", None)
+        if not document or not thumbs:
+            return None
+
+        thumb_path = os.path.join(temp_dir, safe_name(self._suggest_thumb_name()))
+        downloaded_thumb = await self.client.download_media(document, file=thumb_path, thumb=-1)
+        if downloaded_thumb and os.path.exists(downloaded_thumb):
+            logging.info("Prepared temp media thumb=%s", self._safe_log_path(downloaded_thumb))
+            return downloaded_thumb
+        return None
+
     def _is_valid_media_file(self, file_path: str, expected_size: int) -> bool:
         if not file_path or not os.path.exists(file_path):
             return False
@@ -123,9 +169,7 @@ class TgcfMessage:
         connection_count = max(1, min(configured_connections, 20))
         file_meta = getattr(self.message, "file", None)
         expected_size = getattr(file_meta, "size", None)
-        file_name = getattr(file_meta, "name", None)
-        if not file_name:
-            file_name = f"msg_{getattr(self.message, 'id', 'unknown')}.bin"
+        file_name = self._suggest_file_name()
         cache_name = f"{getattr(self.message, 'id', 'unknown')}_{safe_name(file_name)}"
         target_path = os.path.join(temp_dir, cache_name)
         part_path = target_path + ".part"
@@ -425,6 +469,7 @@ class TgcfMessage:
             raise FileNotFoundError("Failed to download a valid media file.")
         self.new_file = downloaded
         logging.info("Prepared temp media file=%s", self._safe_log_path(self.new_file))
+        self.thumb_file = await self._download_source_thumb(temp_dir)
         # Keep downloaded blobs in temp so future forwards can reuse them.
         self.cleanup = False
         return self.new_file
@@ -441,6 +486,9 @@ class TgcfMessage:
         if self.new_file and self.cleanup:
             cleanup(self.new_file)
             self.new_file = None
+        if self.thumb_file and self.cleanup:
+            cleanup(self.thumb_file)
+            self.thumb_file = None
 
 
 class TgcfPlugin:

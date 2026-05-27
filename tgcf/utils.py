@@ -8,6 +8,7 @@ import sys
 from datetime import datetime
 from typing import TYPE_CHECKING
 
+from telethon import utils as telethon_utils
 from telethon.client import TelegramClient
 from telethon.hints import EntityLike
 from telethon.tl.custom.message import Message
@@ -15,11 +16,12 @@ from telethon.tl.custom.message import Message
 from tgcf import __version__
 from tgcf.config import CONFIG
 from tgcf.fast_transfer import upload_file as fast_upload_file
-from tgcf.plugin_models import STYLE_CODES
+from tgcf.plugin_models import FileType, STYLE_CODES
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 TEMP_DIR = os.path.join(BASE_DIR, "temp")
 FAST_SEND_FILE_PART_SIZE_KB = 1024
+TELEGRAM_SAFE_MAX_UPLOAD_PART_SIZE_KB = 512
 
 
 async def _send_file_fast_compatible(client: TelegramClient, *args, **kwargs):
@@ -27,29 +29,70 @@ async def _send_file_fast_compatible(client: TelegramClient, *args, **kwargs):
         recipient = args[0]
         file = args[1]
         configured_part_size = int(getattr(CONFIG.live, "transfer_part_size_kb", FAST_SEND_FILE_PART_SIZE_KB) or FAST_SEND_FILE_PART_SIZE_KB)
-        configured_part_size = max(64, min(configured_part_size, 4096))
+        configured_part_size = max(64, min(configured_part_size, TELEGRAM_SAFE_MAX_UPLOAD_PART_SIZE_KB))
         part_size_kb = kwargs.pop("part_size_kb", configured_part_size)
         configured_connections = int(getattr(CONFIG.live, "transfer_connection_count", 8) or 8)
         connection_count = max(1, min(configured_connections, 20))
         progress_callback = kwargs.pop("progress_callback", None)
+        source_media_type = kwargs.pop("source_media_type", None)
+
+        if source_media_type == FileType.PHOTO:
+            return await client.send_file(recipient, file, *args[2:], **kwargs)
+
+        if isinstance(file, (str, os.PathLike)) and os.path.exists(file):
+            voice_note = source_media_type == FileType.AUDIO and False
+            video_note = source_media_type == FileType.VIDEO_NOTE
+            supports_streaming = source_media_type == FileType.VIDEO
+            attributes, mime_type = telethon_utils.get_attributes(
+                file,
+                force_document=False,
+                voice_note=voice_note,
+                video_note=video_note,
+                supports_streaming=supports_streaming,
+            )
+            kwargs = {
+                **kwargs,
+                "attributes": attributes,
+                "mime_type": mime_type,
+                "force_document": False,
+                "voice_note": voice_note,
+                "video_note": video_note,
+                "supports_streaming": supports_streaming,
+            }
+
+        def _is_payload_too_big_error(err: Exception) -> bool:
+            text = str(err).lower()
+            return "payload is too big" in text or "savebigfilepartrequest is too long" in text
+
+        async def _fast_upload_with_adaptive_part_size(item):
+            current_part_size = max(64, min(int(part_size_kb), TELEGRAM_SAFE_MAX_UPLOAD_PART_SIZE_KB))
+            while True:
+                try:
+                    return await fast_upload_file(
+                        client,
+                        item,
+                        progress_callback=progress_callback,
+                        part_size_kb=current_part_size,
+                        connection_count=connection_count,
+                    )
+                except Exception as err:
+                    if not _is_payload_too_big_error(err):
+                        raise
+                    next_part_size = max(64, current_part_size // 2)
+                    if next_part_size >= current_part_size:
+                        raise
+                    logging.warning(
+                        "fast upload payload too big; retrying with smaller part_size_kb=%s (previous=%s)",
+                        next_part_size,
+                        current_part_size,
+                    )
+                    current_part_size = next_part_size
 
         async def _prepare(item):
             if isinstance(item, (str, os.PathLike)) and os.path.exists(item):
-                return await fast_upload_file(
-                    client,
-                    item,
-                    progress_callback=progress_callback,
-                    part_size_kb=part_size_kb,
-                    connection_count=connection_count,
-                )
+                return await _fast_upload_with_adaptive_part_size(item)
             if getattr(item, "read", None):
-                return await fast_upload_file(
-                    client,
-                    item,
-                    progress_callback=progress_callback,
-                    part_size_kb=part_size_kb,
-                    connection_count=connection_count,
-                )
+                return await _fast_upload_with_adaptive_part_size(item)
             return item
 
         if isinstance(file, (list, tuple)):
@@ -57,7 +100,13 @@ async def _send_file_fast_compatible(client: TelegramClient, *args, **kwargs):
         else:
             file = await _prepare(file)
 
-        return await client.send_file(recipient, file, *args[2:], **kwargs)
+        try:
+            return await client.send_file(recipient, file, *args[2:], **kwargs)
+        except TypeError as err:
+            if "thumb" not in str(err):
+                raise
+            kwargs.pop("thumb", None)
+            return await client.send_file(recipient, file, *args[2:], **kwargs)
 
     try:
         return await client.send_file(*args, **kwargs)
@@ -90,6 +139,8 @@ async def send_message(recipient: EntityLike, tm: "TgcfMessage") -> Message:
     client: TelegramClient = tm.client
     if CONFIG.show_forwarded_from:
         return await client.forward_messages(recipient, tm.message)
+    if tm.file_type == FileType.PHOTO and tm.new_file:
+        return await client.send_file(recipient, tm.new_file, caption=tm.text, reply_to=tm.reply_to)
     if tm.new_file:
         message = await _send_file_fast_compatible(
             client,
@@ -98,6 +149,8 @@ async def send_message(recipient: EntityLike, tm: "TgcfMessage") -> Message:
             caption=tm.text,
             reply_to=tm.reply_to,
             part_size_kb=FAST_SEND_FILE_PART_SIZE_KB,
+            source_media_type=tm.file_type,
+            thumb=getattr(tm, "thumb_file", None),
         )
         return message
     tm.message.text = tm.text

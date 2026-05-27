@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+import os
 import time
 from typing import Iterable, List, Optional
 
@@ -291,78 +292,92 @@ async def forward_batch_with_retry(
 
     import asyncio
     from tgcf.config import CONFIG
+    from tgcf.utils import cleanup
 
     attempt = 0
     flood_wait_attempt = 0
     max_non_429_retries = CONFIG.live.retry_max_attempts_for_non_429
     max_flood_wait_retries = CONFIG.live.retry_max_attempts_for_flood_wait
     backoff_base_seconds = CONFIG.live.retry_backoff_base_seconds
+    downloaded_media_cache: dict[int, str] = {}
 
-    while True:
-        try:
-            logging.info(
-                "forward_batch_with_retry attempt=%s flood_wait_attempt=%s recipient=%s message_count=%s",
-                attempt + 1,
-                flood_wait_attempt,
-                recipient,
-                len(messages),
-            )
-            return await send_batch(recipient, messages, reply_to=reply_to)
-        except Exception as err:
-            if is_flood_wait_error(err):
-                if not CONFIG.live.retry_on_429:
-                    logging.warning("flood wait retry disabled; raising error for recipient=%s", recipient)
-                    raise
-                flood_wait_attempt += 1
-                if flood_wait_attempt > max_flood_wait_retries:
+    try:
+        while True:
+            try:
+                logging.info(
+                    "forward_batch_with_retry attempt=%s flood_wait_attempt=%s recipient=%s message_count=%s",
+                    attempt + 1,
+                    flood_wait_attempt,
+                    recipient,
+                    len(messages),
+                )
+                return await send_batch(
+                    recipient,
+                    messages,
+                    reply_to=reply_to,
+                    downloaded_media_cache=downloaded_media_cache,
+                    cleanup_downloaded_files=False,
+                )
+            except Exception as err:
+                if is_flood_wait_error(err):
+                    if not CONFIG.live.retry_on_429:
+                        logging.warning("flood wait retry disabled; raising error for recipient=%s", recipient)
+                        raise
+                    flood_wait_attempt += 1
+                    if flood_wait_attempt > max_flood_wait_retries:
+                        logging.warning(
+                            "flood wait retries exhausted: recipient=%s attempts=%s",
+                            recipient,
+                            flood_wait_attempt,
+                        )
+                        raise
                     logging.warning(
-                        "flood wait retries exhausted: recipient=%s attempts=%s",
+                        "flood wait encountered: recipient=%s wait=%s seconds attempt=%s/%s",
                         recipient,
+                        max(flood_wait_seconds(err), 1),
                         flood_wait_attempt,
+                        max_flood_wait_retries,
+                    )
+                    await asyncio.sleep(max(flood_wait_seconds(err), 1))
+                    continue
+
+                if is_permission_error(err):
+                    logging.warning("permission error for recipient=%s: %s", recipient, err)
+                    raise
+
+                if not is_retryable_error(err):
+                    logging.warning("non-retryable error for recipient=%s: %s", recipient, err)
+                    raise
+
+                attempt += 1
+                if attempt > max_non_429_retries:
+                    logging.warning(
+                        "non-429 retries exhausted: recipient=%s attempts=%s last_error=%s",
+                        recipient,
+                        attempt,
+                        err,
                     )
                     raise
                 logging.warning(
-                    "flood wait encountered: recipient=%s wait=%s seconds attempt=%s/%s",
-                    recipient,
-                    max(flood_wait_seconds(err), 1),
-                    flood_wait_attempt,
-                    max_flood_wait_retries,
-                )
-                await asyncio.sleep(max(flood_wait_seconds(err), 1))
-                continue
-
-            if is_permission_error(err):
-                logging.warning("permission error for recipient=%s: %s", recipient, err)
-                raise
-
-            if not is_retryable_error(err):
-                logging.warning("non-retryable error for recipient=%s: %s", recipient, err)
-                raise
-
-            attempt += 1
-            if attempt > max_non_429_retries:
-                logging.warning(
-                    "non-429 retries exhausted: recipient=%s attempts=%s last_error=%s",
+                    "retrying after error: recipient=%s attempt=%s/%s wait=%s seconds error=%s",
                     recipient,
                     attempt,
+                    max_non_429_retries,
+                    backoff_base_seconds * (2 ** (attempt - 1)),
                     err,
                 )
-                raise
-            logging.warning(
-                "retrying after error: recipient=%s attempt=%s/%s wait=%s seconds error=%s",
-                recipient,
-                attempt,
-                max_non_429_retries,
-                backoff_base_seconds * (2 ** (attempt - 1)),
-                err,
-            )
-            await asyncio.sleep(backoff_base_seconds * (2 ** (attempt - 1)))
+                await asyncio.sleep(backoff_base_seconds * (2 ** (attempt - 1)))
+    finally:
+        if downloaded_media_cache:
+            cleanup(*set(downloaded_media_cache.values()))
 
 
 async def send_batch(
     recipient,
     messages: List[Message],
     reply_to: Optional[int] = None,
+    downloaded_media_cache: Optional[dict[int, str]] = None,
+    cleanup_downloaded_files: bool = True,
 ):
     """Forward a batch of messages, falling back to download/upload when needed."""
 
@@ -372,11 +387,19 @@ async def send_batch(
 
     transformed = []
     fallback_downloaded_files: List[str] = []
+    downloaded_media_cache = downloaded_media_cache or {}
 
     async def _get_downloaded_file(tm):
+        message_id = int(getattr(tm.message, "id", 0) or 0)
+        cached = downloaded_media_cache.get(message_id)
+        if cached and os.path.exists(cached):
+            return cached
+
         file_path = await tm.get_file()
         if file_path:
             fallback_downloaded_files.append(file_path)
+            if message_id:
+                downloaded_media_cache[message_id] = file_path
         return file_path
 
     try:
@@ -455,6 +478,8 @@ async def send_batch(
                         caption=tm.text,
                         reply_to=reply_to,
                         part_size_kb=CONFIG.live.transfer_part_size_kb,
+                        source_media_type=tm.file_type,
+                        thumb=getattr(tm, "thumb_file", None),
                     )
                     logging.info(
                         "send_file fallback succeeded: recipient=%s file=%s caption=%s",
@@ -503,6 +528,7 @@ async def send_batch(
                 caption=captions,
                 reply_to=reply_to,
                 part_size_kb=CONFIG.live.transfer_part_size_kb,
+                source_media_type=transformed[0].file_type,
             )
             if isinstance(uploaded, list):
                 return uploaded
@@ -512,5 +538,5 @@ async def send_batch(
     finally:
         for tm in transformed:
             tm.clear()
-        if fallback_downloaded_files:
+        if cleanup_downloaded_files and fallback_downloaded_files:
             cleanup(*set(fallback_downloaded_files))

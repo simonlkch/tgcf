@@ -16,6 +16,7 @@ todo
 *.ipynb
 .playwright-mcp/
 temp/
+*.sqlite3
 
 
 # Byte-compiled / optimized / DLL files

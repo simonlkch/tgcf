@@ -72,12 +72,11 @@ async def forward_job() -> None:
             )
             forward: config.Forward
             source_event = {
-                "event": "past_source_scan",
                 "source_chat_id": src,
                 "destination_count": len(dest),
                 "offset": forward.offset,
                 "end": forward.end,
-            )
+            }
             source_start = time.perf_counter()
             log_event(logger, logging.INFO, "past_source_scan_started", **source_event)
             if exact_id_mode:

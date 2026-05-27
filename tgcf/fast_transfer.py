@@ -29,6 +29,7 @@ from telethon.tl.types import (
 )
 
 log = logging.getLogger(__name__)
+TELEGRAM_SAFE_MAX_UPLOAD_PART_SIZE_KB = 512
 
 TypeLocation = Union[
     Document,
@@ -77,6 +78,20 @@ def _ensure_binary_file(file: UploadInput) -> Tuple[BinaryIO, bool]:
     if isinstance(file, (str, os.PathLike)):
         return open(file, "rb"), True
     return file, False
+
+
+def _upload_file_name(file: UploadInput) -> str:
+    if isinstance(file, (str, os.PathLike)):
+        name = os.path.basename(os.fspath(file))
+        return name or "upload.bin"
+
+    stream_name = getattr(file, "name", None)
+    if isinstance(stream_name, str):
+        base = os.path.basename(stream_name)
+        if base:
+            return base
+
+    return "upload.bin"
 
 
 class DownloadSender:
@@ -390,7 +405,9 @@ class ParallelTransferrer:
         connection_count: Optional[int] = None,
     ) -> Tuple[int, int, bool]:
         connection_count = connection_count or self._get_connection_count(file_size)
-        part_size = int((part_size_kb or telethon_utils.get_appropriated_part_size(file_size)) * 1024)
+        selected_part_size_kb = part_size_kb or telethon_utils.get_appropriated_part_size(file_size)
+        selected_part_size_kb = max(32, min(float(selected_part_size_kb), TELEGRAM_SAFE_MAX_UPLOAD_PART_SIZE_KB))
+        part_size = int(selected_part_size_kb * 1024)
         part_count = (file_size + part_size - 1) // part_size
         is_large = file_size > 10 * 1024 * 1024
         await self._create_upload_sender_list(connection_count, file_id, part_count, is_large)
@@ -461,6 +478,7 @@ async def _internal_transfer_to_telegram(
     connection_count: Optional[int] = None,
 ) -> Tuple[Union[InputFileBig, InputFile], int]:
     file, should_close = _ensure_binary_file(response)
+    upload_name = _upload_file_name(response)
     try:
         file_size = _get_file_size(response)
         with suppress(Exception):
@@ -508,8 +526,8 @@ async def _internal_transfer_to_telegram(
         finally:
             await uploader.finish_upload()
         if is_large:
-            return InputFileBig(file_id, part_count, "upload"), file_size
-        return InputFile(file_id, part_count, "upload", hash_md5.hexdigest()), file_size
+            return InputFileBig(file_id, part_count, upload_name), file_size
+        return InputFile(file_id, part_count, upload_name, hash_md5.hexdigest()), file_size
     finally:
         if should_close:
             file.close()

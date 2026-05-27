@@ -145,6 +145,28 @@ if check_password(st):
                 step=1,
             )
 
+            st.markdown("### Transfer Settings")
+            CONFIG.live.transfer_connection_count = int(
+                st.number_input(
+                    "Upload transfer connections",
+                    min_value=1,
+                    max_value=20,
+                    value=int(CONFIG.live.transfer_connection_count),
+                    step=1,
+                    help="Parallel upload worker count. Higher may improve speed but can be less stable on weak networks.",
+                )
+            )
+            CONFIG.live.transfer_part_size_kb = int(
+                st.number_input(
+                    "Upload part size (KB)",
+                    min_value=64,
+                    max_value=512,
+                    value=min(512, int(CONFIG.live.transfer_part_size_kb)),
+                    step=32,
+                    help="Telegram-safe upload chunk size. Values above 512 KB are blocked to avoid FILE_PART_TOO_BIG.",
+                )
+            )
+
             if st.checkbox("Customize Bot Messages"):
                 st.info(
                     "Note: For userbots, the commands start with `.` instead of `/`, like `.start` and not `/start`"

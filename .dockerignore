@@ -18,6 +18,7 @@ todo
 *.ipynb
 .playwright-mcp/
 .github/skills/
+*.sqlite3
 
 # Git
 .git
