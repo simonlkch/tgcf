@@ -7,6 +7,7 @@
 import asyncio
 import logging
 import time
+from typing import List, Optional
 
 from telethon import TelegramClient
 from telethon.errors.rpcerrorlist import FloodWaitError
@@ -19,6 +20,110 @@ from tgcf.forwarding import build_forward_batches, forward_source_batch
 from tgcf.logging_utils import log_event
 from tgcf.plugins import load_async_plugins
 from tgcf.utils import clean_session_files
+
+
+def _message_caption_text(message: Optional[Message]) -> str:
+    if not message:
+        return ""
+    return (getattr(message, "message", "") or "").strip()
+
+
+async def _last_non_service_message(client: TelegramClient, chat_id: int) -> Optional[Message]:
+    async for message in client.iter_messages(chat_id, limit=20):
+        if isinstance(message, MessageService):
+            continue
+        return message
+    return None
+
+
+async def _find_source_message_by_caption(
+    client: TelegramClient, source_chat_id: int, caption: str
+) -> Optional[Message]:
+    async for message in client.iter_messages(source_chat_id, search=caption, limit=100):
+        if isinstance(message, MessageService):
+            continue
+        if _message_caption_text(message) == caption:
+            return message
+    return None
+
+
+async def _collect_source_album(
+    client: TelegramClient, source_chat_id: int, grouped_id: int, anchor_id: int
+) -> List[Message]:
+    lower_id = max(0, anchor_id - 200)
+    upper_id = anchor_id + 200
+    album_messages: List[Message] = []
+    async for message in client.iter_messages(
+        source_chat_id,
+        min_id=lower_id,
+        max_id=upper_id,
+        reverse=True,
+    ):
+        if isinstance(message, MessageService):
+            continue
+        if getattr(message, "grouped_id", None) == grouped_id:
+            album_messages.append(message)
+    return sorted(album_messages, key=lambda item: item.id)
+
+
+async def _build_resume_state_from_destination(
+    client: TelegramClient, source_chat_id: int, destinations: List[int]
+) -> Optional[dict]:
+    if not destinations:
+        return None
+
+    destination_chat_id = destinations[0]
+    destination_last = await _last_non_service_message(client, destination_chat_id)
+    if destination_last is None:
+        return None
+
+    destination_grouped_id = getattr(destination_last, "grouped_id", None)
+    caption = _message_caption_text(destination_last)
+
+    if destination_grouped_id is not None and not caption:
+        async for msg in client.iter_messages(destination_chat_id, limit=30):
+            if isinstance(msg, MessageService):
+                continue
+            if getattr(msg, "grouped_id", None) == destination_grouped_id:
+                caption = _message_caption_text(msg)
+                if caption:
+                    break
+
+    if not caption:
+        return None
+
+    source_match = await _find_source_message_by_caption(client, source_chat_id, caption)
+    if source_match is None:
+        return None
+
+    source_last = await client.get_messages(source_chat_id, limit=1)
+    source_last_id = source_match.id
+    if source_last:
+        source_last_id = source_last[0].id
+
+    source_grouped_id = getattr(source_match, "grouped_id", None)
+    if destination_grouped_id is None or source_grouped_id is None:
+        return {
+            "offset": source_match.id,
+            "end": source_last_id,
+            "album_messages": None,
+            "caption": caption,
+            "destination_last_id": destination_last.id,
+        }
+
+    album_messages = await _collect_source_album(
+        client, source_chat_id, source_grouped_id, source_match.id
+    )
+    if not album_messages:
+        return None
+
+    return {
+        "offset": album_messages[-1].id,
+        "end": source_last_id,
+        "album_messages": album_messages,
+        "caption": caption,
+        "destination_last_id": destination_last.id,
+    }
 
 
 async def forward_job() -> None:
@@ -61,6 +166,48 @@ async def forward_job() -> None:
         client: TelegramClient
         for from_to, forward in zip(config.from_to.items(), active_forwards):
             src, dest = from_to
+
+            resume_state = None
+            if CONFIG.past.resume_from_destination_caption:
+                resume_state = await _build_resume_state_from_destination(client, src, dest)
+
+            if resume_state is not None:
+                forward.offset = int(resume_state["offset"])
+                forward.end = int(resume_state["end"])
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "past_resume_state_updated",
+                    source_chat_id=src,
+                    destination_chat_id=dest[0] if dest else None,
+                    destination_last_id=resume_state["destination_last_id"],
+                    matched_caption=resume_state["caption"],
+                    new_offset=forward.offset,
+                    new_end=forward.end,
+                    album_bootstrap=bool(resume_state["album_messages"]),
+                )
+
+                album_messages = resume_state["album_messages"]
+                if album_messages:
+                    await forward_source_batch(album_messages, dest)
+                    log_event(
+                        logger,
+                        logging.INFO,
+                        "past_album_bootstrap_forwarded",
+                        source_chat_id=src,
+                        destination_count=len(dest),
+                        album_message_count=len(album_messages),
+                        last_forwarded_id=album_messages[-1].id,
+                    )
+            elif CONFIG.past.resume_from_destination_caption:
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "past_resume_state_not_found",
+                    source_chat_id=src,
+                    destination_chat_id=dest[0] if dest else None,
+                )
+
             last_id = 0
             scanned_count = 0
             accepted_count = 0

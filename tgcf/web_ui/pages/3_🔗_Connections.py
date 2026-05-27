@@ -9,7 +9,7 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.patched import MessageService
 
-from tgcf.config import CONFIG, Forward, read_config, write_config
+from tgcf.config import CONFIG, Forward, PastSettings, read_config, write_config
 from tgcf.web_ui.password import check_password
 from tgcf.web_ui.utils import apply_page_chrome, get_list, get_string, hide_st, switch_theme
 
@@ -672,6 +672,170 @@ async def _latest_target_messages(forward: Forward) -> List[Dict[str, Any]]:
         await client.disconnect()
 
 
+def _caption_text(message) -> str:
+    return (getattr(message, "raw_text", None) or getattr(message, "message", "") or "").strip()
+
+
+async def _last_non_service_message(entity, client: TelegramClient, limit: int = 30):
+    async for msg in client.iter_messages(entity, limit=limit):
+        if isinstance(msg, MessageService):
+            continue
+        return msg
+    return None
+
+
+async def _find_source_message_by_exact_caption(
+        source_entity,
+        caption: str,
+        client: TelegramClient,
+):
+    async for msg in client.iter_messages(source_entity, search=caption, limit=100):
+        if isinstance(msg, MessageService):
+            continue
+        if _caption_text(msg) == caption:
+            return msg
+    return None
+
+
+async def _collect_album_ids(
+        source_entity,
+        grouped_id: int,
+        anchor_id: int,
+        client: TelegramClient,
+) -> List[int]:
+    lower_id = max(0, anchor_id - 200)
+    upper_id = anchor_id + 200
+    ids: List[int] = []
+    async for msg in client.iter_messages(source_entity, min_id=lower_id, max_id=upper_id, reverse=True):
+        if isinstance(msg, MessageService):
+            continue
+        if getattr(msg, "grouped_id", None) == grouped_id:
+            ids.append(msg.id)
+    ids.sort()
+    return ids
+
+
+async def _apply_resume_offsets_and_end() -> Dict[str, Any]:
+    """Compute and persist offset/end from destination caption for enabled connections."""
+
+    rows: List[Dict[str, Any]] = []
+    updated = 0
+
+    client = await _connect_client()
+    try:
+        for idx, forward in enumerate(CONFIG.forwards):
+            con_label = forward.con_name.strip() or f"Connection {idx + 1}"
+
+            if not forward.use_this:
+                rows.append({"connection": con_label, "status": "skipped", "details": "disabled"})
+                continue
+
+            source = _parse_peer(forward.source)
+            destinations = [_parse_peer(item) for item in forward.dest if str(item).strip() != ""]
+            if source == "" or not destinations:
+                rows.append(
+                    {
+                        "connection": con_label,
+                        "status": "skipped",
+                        "details": "missing source or destination",
+                    }
+                )
+                continue
+
+            try:
+                source_entity = await client.get_entity(source)
+                dest_entity = await client.get_entity(destinations[0])
+
+                destination_last = await _last_non_service_message(dest_entity, client)
+                if destination_last is None:
+                    rows.append(
+                        {
+                            "connection": con_label,
+                            "status": "no-update",
+                            "details": "destination has no user message",
+                        }
+                    )
+                    continue
+
+                destination_grouped_id = getattr(destination_last, "grouped_id", None)
+                caption = _caption_text(destination_last)
+                if destination_grouped_id is not None and not caption:
+                    async for msg in client.iter_messages(dest_entity, limit=30):
+                        if isinstance(msg, MessageService):
+                            continue
+                        if getattr(msg, "grouped_id", None) == destination_grouped_id:
+                            caption = _caption_text(msg)
+                            if caption:
+                                break
+
+                if not caption:
+                    rows.append(
+                        {
+                            "connection": con_label,
+                            "status": "no-update",
+                            "details": "destination last message has no caption/text",
+                        }
+                    )
+                    continue
+
+                source_match = await _find_source_message_by_exact_caption(source_entity, caption, client)
+                if source_match is None:
+                    rows.append(
+                        {
+                            "connection": con_label,
+                            "status": "no-update",
+                            "details": "source caption match not found",
+                        }
+                    )
+                    continue
+
+                source_last = await client.get_messages(source_entity, limit=1)
+                source_last_id = source_match.id
+                if source_last:
+                    source_last_id = source_last[0].id
+
+                new_offset = source_match.id
+                source_grouped_id = getattr(source_match, "grouped_id", None)
+                if destination_grouped_id is not None and source_grouped_id is not None:
+                    album_ids = await _collect_album_ids(
+                        source_entity,
+                        source_grouped_id,
+                        source_match.id,
+                        client,
+                    )
+                    if album_ids:
+                        new_offset = album_ids[-1]
+
+                old_offset = int(forward.offset or 0)
+                old_end = int(forward.end or 0)
+                new_end = int(source_last_id)
+                forward.offset = int(new_offset)
+                forward.end = new_end
+                updated += 1
+                rows.append(
+                    {
+                        "connection": con_label,
+                        "status": "updated",
+                        "details": f"offset {old_offset} -> {forward.offset}, end {old_end} -> {forward.end}",
+                    }
+                )
+            except Exception as err:
+                rows.append(
+                    {
+                        "connection": con_label,
+                        "status": "error",
+                        "details": str(err),
+                    }
+                )
+    finally:
+        await client.disconnect()
+
+    if updated > 0:
+        write_config(CONFIG)
+
+    return {"updated": updated, "rows": rows}
+
+
 def _inject_connections_theme() -> None:
     dark = CONFIG.theme == "dark"
     hero_border = "rgba(56, 189, 248, 0.35)" if dark else "rgba(14, 96, 82, 0.25)"
@@ -773,6 +937,57 @@ if check_password(st):
     if save_top:
         write_config(CONFIG)
         st.rerun()
+
+    with st.expander("Past Resume Settings", expanded=False):
+        current_resume_setting = bool(
+            getattr(CONFIG.past, "resume_from_destination_caption", True)
+        )
+        resume_setting = st.checkbox(
+            "Resume by destination last caption / album caption",
+            value=current_resume_setting,
+            help=(
+                "Use destination latest caption to match source message, then auto-set offset/end. "
+                "If the match is an album, send that source album first."
+            ),
+        )
+        try:
+            CONFIG.past.resume_from_destination_caption = resume_setting
+        except Exception:
+            # Rebuild legacy/partial past settings with the new field present.
+            raw_past = {}
+            if hasattr(CONFIG.past, "dict"):
+                raw_past = CONFIG.past.dict()
+            raw_past["resume_from_destination_caption"] = resume_setting
+            CONFIG.past = PastSettings(**raw_past)
+        st.caption("This is a global past-mode behavior and applies to all connections.")
+        if st.button("Save resume setting", key="save-past-resume-setting"):
+            write_config(CONFIG)
+            st.rerun()
+
+        if st.button("Update offsets/end from destination captions", key="apply-past-resume-offset-end"):
+            try:
+                with st.spinner("Computing resume offsets/end for enabled connections..."):
+                    apply_result = _run(_apply_resume_offsets_and_end())
+                st.session_state["past-resume-apply-result"] = apply_result
+            except Exception as err:
+                st.session_state["past-resume-apply-result"] = {
+                    "updated": 0,
+                    "rows": [{"connection": "-", "status": "error", "details": str(err)}],
+                }
+
+        apply_result = st.session_state.get("past-resume-apply-result")
+        if apply_result:
+            st.caption(f"Updated connections: {apply_result.get('updated', 0)}")
+            _render_copyable_table(
+                apply_result.get("rows", []),
+                [
+                    {"field": "connection", "label": "Connection"},
+                    {"field": "status", "label": "Status"},
+                    {"field": "details", "label": "Details"},
+                ],
+                key="past_resume_apply_rows",
+                min_height=160,
+            )
 
     num = len(CONFIG.forwards)
 
