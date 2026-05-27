@@ -15,7 +15,7 @@ typer = "^0.7.0"
 python-dotenv = "^0.21.0"
 pydantic = "^1.10.2"
 Telethon = ">=1.43.2"
-cryptg = [{version = "^0.4.0", python = ">=3.13,<3.14"}]
+cryptg = [{version = "^0.6.0", python = ">=3.13,<3.14"}]
 Pillow = {version = ">=9.3,<11.0", python = ">=3.13,<3.14"}
 hachoir = "^3.1.3"
 aiohttp = "^3.8.3"

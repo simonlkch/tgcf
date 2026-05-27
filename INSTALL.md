@@ -14,6 +14,9 @@ py -3.13 -m venv .venv313
 python -m pip install --upgrade pip wheel setuptools
 python -m pip install -e .
 
+# This repo now pins cryptg 0.6.0 for Python 3.13 on Windows.
+# If you reinstall after updating the lockfile, the editable install should pick it up automatically.
+
 # Verify CLI is available
 tgcf --version
 ```
