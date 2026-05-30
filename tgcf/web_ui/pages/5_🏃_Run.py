@@ -15,19 +15,32 @@ CONFIG = read_config()
 
 
 def _extract_progress(log_lines):
-    """Extract latest download progress line produced by tqdm."""
+    """Extract latest transfer progress line produced by tqdm."""
 
     for line in reversed(log_lines):
-        if "download msg" not in line:
+        if "download msg" not in line and "upload " not in line:
             continue
-        msg_match = re.search(r"download msg\s+(\d+):\s*(\d+)%", line)
-        if not msg_match:
+        progress_match = re.search(r"(download msg\s+\d+|upload\s+[^:]+):\s*(\d+)%", line)
+        if not progress_match:
             continue
         size_match = re.search(r"\|\s*([0-9.]+[KMG]?)/([0-9.]+[KMG]?)", line)
+        speed_match = re.search(r"([0-9.]+)\s*([KMG]?)B/s", line)
+        speed_mb_s = None
+        if speed_match:
+            value = float(speed_match.group(1))
+            unit = (speed_match.group(2) or "").upper()
+            factor = {"": 1 / (1024 * 1024), "K": 1 / 1024, "M": 1.0, "G": 1024.0}.get(unit, 1.0)
+            speed_mb_s = value * factor
+        label = progress_match.group(1)
+        direction = "download" if label.startswith("download msg") else "upload"
+        msg_id_match = re.search(r"download msg\s+(\d+)", label)
         return {
-            "message_id": int(msg_match.group(1)),
-            "percent": int(msg_match.group(2)),
+            "direction": direction,
+            "label": label,
+            "message_id": int(msg_id_match.group(1)) if msg_id_match else None,
+            "percent": int(progress_match.group(2)),
             "size": f"{size_match.group(1)}/{size_match.group(2)}" if size_match else "",
+            "speed_mb_s": speed_mb_s,
             "line": line.strip(),
         }
     return None
@@ -43,16 +56,30 @@ def _log_summary(log_lines):
 
 def _extract_progress_history(log_lines, limit=200):
     history = []
+    download_mb_s = 0.0
+    upload_mb_s = 0.0
     for line in log_lines:
-        if "download msg" not in line:
+        if "download msg" not in line and "upload " not in line:
             continue
-        match = re.search(r"download msg\s+(\d+):\s*(\d+)%", line)
-        if not match:
+        progress_match = re.search(r"(download msg\s+\d+|upload\s+[^:]+):\s*(\d+)%", line)
+        if not progress_match:
             continue
+        speed_match = re.search(r"([0-9.]+)\s*([KMG]?)B/s", line)
+        if not speed_match:
+            continue
+        value = float(speed_match.group(1))
+        unit = (speed_match.group(2) or "").upper()
+        factor = {"": 1 / (1024 * 1024), "K": 1 / 1024, "M": 1.0, "G": 1024.0}.get(unit, 1.0)
+        speed_mb_s = value * factor
+
+        if progress_match.group(1).startswith("download msg"):
+            download_mb_s = speed_mb_s
+        else:
+            upload_mb_s = speed_mb_s
         history.append(
             {
-                "message_id": int(match.group(1)),
-                "percent": int(match.group(2)),
+                "download_mb_s": download_mb_s,
+                "upload_mb_s": upload_mb_s,
             }
         )
     return history[-limit:]
@@ -231,11 +258,27 @@ if check_password(st):
         metric_3.metric("Errors", summary["error"])
         metric_4.metric("Process", "Running" if CONFIG.pid != 0 else "Stopped")
 
+        auto_refresh_enabled = st.checkbox(
+            "Auto-refresh",
+            value=True,
+            key="run_auto_refresh_enabled",
+            help="Enable periodic refresh of logs and charts while tgcf is running.",
+        )
+        auto_refresh_seconds = st.slider(
+            "Auto-refresh interval (seconds)",
+            min_value=3,
+            max_value=10,
+            value=5,
+            step=1,
+            key="run_auto_refresh_seconds",
+            disabled=not auto_refresh_enabled,
+            help="When process is running, logs and charts will refresh automatically at this interval.",
+        )
+
         progress = _extract_progress(log_lines)
         if progress:
-            st.info(
-                f"Message {progress['message_id']} transfer: {progress['percent']}% {progress['size']}"
-            )
+            speed_text = f" | {progress['speed_mb_s']:.2f} MB/s" if progress.get("speed_mb_s") is not None else ""
+            st.info(f"{progress['label']} transfer: {progress['percent']}% {progress['size']}{speed_text}")
             st.progress(progress["percent"] / 100)
 
         progress_history = _extract_progress_history(log_lines)
@@ -247,15 +290,16 @@ if check_password(st):
             left, right = st.columns([2, 1])
             with left:
                 if progress_history:
-                    st.write("Transfer progress trend")
+                    st.write("Transfer speed trend (MB/s)")
                     st.line_chart(
                         {
-                            "percent": [item["percent"] for item in progress_history],
+                            "download_mb_s": [item["download_mb_s"] for item in progress_history],
+                            "upload_mb_s": [item["upload_mb_s"] for item in progress_history],
                         },
                         use_container_width=True,
                     )
                 else:
-                    st.info("No transfer progress data yet.")
+                    st.info("No transfer speed data yet.")
             with right:
                 if progress:
                     st.write("Latest transfer")
@@ -307,6 +351,13 @@ if check_password(st):
                 data=tail_text,
                 file_name="tgcf_visible_logs.txt",
             )
+
+        if CONFIG.pid != 0 and auto_refresh_enabled:
+            st.caption(f"Auto-refreshing every {auto_refresh_seconds}s while running.")
+            time.sleep(auto_refresh_seconds)
+            st.rerun()
+        elif CONFIG.pid != 0:
+            st.caption("Auto-refresh is off.")
 
     except FileNotFoundError:
         st.write("No present logs found")

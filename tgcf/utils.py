@@ -4,6 +4,7 @@ import logging
 import os
 import platform
 import re
+import time
 import sys
 from datetime import datetime
 from typing import TYPE_CHECKING
@@ -12,6 +13,7 @@ from telethon import utils as telethon_utils
 from telethon.client import TelegramClient
 from telethon.hints import EntityLike
 from telethon.tl.custom.message import Message
+from tqdm import tqdm
 
 from tgcf import __version__
 from tgcf.config import CONFIG
@@ -64,14 +66,68 @@ async def _send_file_fast_compatible(client: TelegramClient, *args, **kwargs):
             text = str(err).lower()
             return "payload is too big" in text or "savebigfilepartrequest is too long" in text
 
+        def _safe_upload_label(item) -> str:
+            if isinstance(item, (str, os.PathLike)):
+                label = os.path.basename(str(item)) or "file"
+            else:
+                label = os.path.basename(getattr(item, "name", "")) or "stream"
+            label = str(label).replace("\n", " ").replace("\r", " ").strip()
+            return label or "file"
+
+        def _build_upload_progress_callback(label: str):
+            progress_bar = None
+            uploaded_bytes = 0
+            last_draw_bytes = 0
+            started_at = time.time()
+
+            async def _callback(current: int, total: int):
+                nonlocal progress_bar, uploaded_bytes, last_draw_bytes
+                if progress_bar is None:
+                    progress_bar = tqdm(
+                        total=total or None,
+                        initial=uploaded_bytes,
+                        unit="B",
+                        unit_scale=True,
+                        unit_divisor=1024,
+                        desc=f"upload {label}",
+                        mininterval=0.25,
+                        smoothing=0.1,
+                        leave=True,
+                    )
+                if total and progress_bar.total != total:
+                    progress_bar.total = total
+                delta = current - uploaded_bytes
+                if delta > 0:
+                    uploaded_bytes = current
+                    progress_bar.update(delta)
+                elapsed = max(time.time() - started_at, 1e-6)
+                speed_mbps = (uploaded_bytes / elapsed) / (1024 * 1024)
+                progress_bar.set_postfix_str(f"{speed_mbps:.2f} MB/s", refresh=False)
+                last_draw_bytes = uploaded_bytes
+                if progress_callback:
+                    maybe_awaitable = progress_callback(current, total)
+                    if hasattr(maybe_awaitable, "__await__"):
+                        await maybe_awaitable
+
+            def _close():
+                if progress_bar is None:
+                    return
+                remaining = uploaded_bytes - last_draw_bytes
+                if remaining > 0:
+                    progress_bar.update(remaining)
+                progress_bar.close()
+
+            return _callback, _close
+
         async def _fast_upload_with_adaptive_part_size(item):
             current_part_size = max(64, min(int(part_size_kb), TELEGRAM_SAFE_MAX_UPLOAD_PART_SIZE_KB))
             while True:
+                upload_progress_callback, close_upload_bar = _build_upload_progress_callback(_safe_upload_label(item))
                 try:
                     return await fast_upload_file(
                         client,
                         item,
-                        progress_callback=progress_callback,
+                        progress_callback=upload_progress_callback,
                         part_size_kb=current_part_size,
                         connection_count=connection_count,
                     )
@@ -87,6 +143,8 @@ async def _send_file_fast_compatible(client: TelegramClient, *args, **kwargs):
                         current_part_size,
                     )
                     current_part_size = next_part_size
+                finally:
+                    close_upload_bar()
 
         async def _prepare(item):
             if isinstance(item, (str, os.PathLike)) and os.path.exists(item):
