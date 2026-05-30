@@ -1,6 +1,9 @@
 import asyncio
+import csv
 import html
 import json
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import streamlit as st
@@ -291,6 +294,32 @@ async def _resolve_peers_batch(peers_with_role: List[Any]) -> Dict[str, List[Dic
             await client.disconnect()
 
     return {"rows": rows, "errors": errors}
+
+
+def _peer_dropdown_labels(peers: List[str]) -> Dict[str, str]:
+    options = [str(item).strip() for item in peers if str(item).strip()]
+    if not options:
+        return {}
+
+    cache = _peer_cache()
+    unresolved = [item for item in options if _cache_key(item) not in cache]
+    if unresolved:
+        try:
+            _run(_resolve_peers_batch([("channel", item) for item in unresolved]))
+        except Exception:
+            # Best-effort enrichment: keep raw IDs/usernames when resolution fails.
+            pass
+
+    labels: Dict[str, str] = {}
+    for item in options:
+        cached = cache.get(_cache_key(item), {})
+        name = str(cached.get("name", "")).strip()
+        peer_id = cached.get("id", item)
+        if name:
+            labels[item] = f"{name} ({peer_id})"
+        else:
+            labels[item] = item
+    return labels
 
 
 async def _search_peers(query: str, limit: int = 30) -> List[Dict[str, Any]]:
@@ -672,6 +701,95 @@ async def _latest_target_messages(forward: Forward) -> List[Dict[str, Any]]:
         await client.disconnect()
 
 
+def _message_export_row(message, source_name: str, source_id: int) -> Dict[str, Any]:
+    media = _message_media_info(message)
+    reply_to = getattr(message, "reply_to", None)
+    media_obj = getattr(message, "media", None)
+    return {
+        "source_name": source_name,
+        "source_id": source_id,
+        "message_id": getattr(message, "id", ""),
+        "date": getattr(message, "date", None).isoformat() if getattr(message, "date", None) else "",
+        "grouped_id": getattr(message, "grouped_id", None) or "",
+        "sender_id": getattr(message, "sender_id", None) or "",
+        "is_service": bool(isinstance(message, MessageService)),
+        "has_media": media["has_media"],
+        "media_class": type(media_obj).__name__ if media_obj is not None else "-",
+        "mime_type": media["mime_type"],
+        "file_name": media["file_name"],
+        "size_bytes": media["size_bytes"],
+        "size_human": media["size_human"],
+        "duration_seconds": media["duration_seconds"],
+        "dimensions": media["dimensions"],
+        "views": getattr(message, "views", None) or "",
+        "forwards": getattr(message, "forwards", None) or "",
+        "reply_to_msg_id": getattr(reply_to, "reply_to_msg_id", None) or "",
+        "text": (getattr(message, "message", "") or "").strip(),
+    }
+
+
+async def _export_channel_messages_to_csv(source_raw: Any) -> Dict[str, Any]:
+    client = await _connect_client()
+    try:
+        source = _parse_peer(source_raw)
+        if source == "":
+            raise ValueError("Source is empty.")
+
+        entity = await client.get_entity(source)
+        source_id = await client.get_peer_id(entity)
+        source_name = _entity_name(entity)
+
+        export_dir = Path("document")
+        export_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        file_name = f"channel_messages_{abs(source_id)}_{timestamp}.csv"
+        file_path = export_dir / file_name
+
+        fieldnames = [
+            "source_name",
+            "source_id",
+            "message_id",
+            "date",
+            "grouped_id",
+            "sender_id",
+            "is_service",
+            "has_media",
+            "media_class",
+            "mime_type",
+            "file_name",
+            "size_bytes",
+            "size_human",
+            "duration_seconds",
+            "dimensions",
+            "views",
+            "forwards",
+            "reply_to_msg_id",
+            "text",
+        ]
+
+        count = 0
+        with file_path.open("w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            async for message in client.iter_messages(entity, reverse=True):
+                writer.writerow(_message_export_row(message, source_name, source_id))
+                count += 1
+                if count % 500 == 0:
+                    print(f"    exported {count} messages...", flush=True)
+
+        return {
+            "file_path": str(file_path),
+            "file_name": file_name,
+            "message_count": count,
+            "channel_name": source_name,
+            "channel_id": source_id,
+            "source_name": source_name,
+            "source_id": source_id,
+        }
+    finally:
+        await client.disconnect()
+
+
 def _caption_text(message) -> str:
     return (getattr(message, "raw_text", None) or getattr(message, "message", "") or "").strip()
 
@@ -1044,6 +1162,11 @@ if check_password(st):
                     unsafe_allow_html=True,
                 )
 
+                source_candidates = []
+                if str(CONFIG.forwards[i].source).strip():
+                    source_candidates = [str(CONFIG.forwards[i].source).strip()]
+                active_source = str(CONFIG.forwards[i].source).strip()
+
                 with st.expander("Metadata", expanded=True):
                     st.write(f"Connection ID: **{con}**")
                     CONFIG.forwards[i].con_name = st.text_input(
@@ -1062,12 +1185,47 @@ if check_password(st):
                 with st.expander("Routing", expanded=True):
                     st.write(f"Configure source and destinations for connection {label}")
 
-                    CONFIG.forwards[i].source = st.text_input(
-                        "Source",
-                        value=CONFIG.forwards[i].source,
-                        key=f"source {con}",
-                    ).strip()
-                    st.caption("Only one source is allowed in each connection.")
+                    default_sources = source_candidates or [""]
+                    source_candidates = get_list(
+                        st.text_area(
+                            "Sources (one per line)",
+                            value=get_string(default_sources),
+                            key=f"sources {con}",
+                            help="Enter multiple source IDs/usernames. The selected active source is used by runtime and tools.",
+                        )
+                    )
+
+                    if source_candidates:
+                        source_labels = _peer_dropdown_labels(source_candidates)
+                        source_picker_key = f"active-source-{con}"
+                        previous_active = st.session_state.get(source_picker_key)
+                        if previous_active not in source_candidates:
+                            previous_active = source_candidates[0]
+
+                        if len(source_candidates) <= 5:
+                            active_source = st.segmented_control(
+                                "Active source",
+                                options=source_candidates,
+                                default=previous_active,
+                                key=source_picker_key,
+                            )
+                        else:
+                            active_source = st.selectbox(
+                                "Active source",
+                                options=source_candidates,
+                                index=source_candidates.index(previous_active),
+                                format_func=lambda item: source_labels.get(item, item),
+                                key=source_picker_key,
+                            )
+                        CONFIG.forwards[i].source = (active_source or source_candidates[0]).strip()
+                    else:
+                        CONFIG.forwards[i].source = ""
+                        active_source = ""
+
+                    if len(source_candidates) > 1:
+                        st.caption("Multiple sources are configured. Forwarding and preview use the active source above.")
+                    else:
+                        st.caption("Add more than one line to maintain a source roster for this connection.")
 
                     CONFIG.forwards[i].dest = get_list(
                         st.text_area(
@@ -1082,7 +1240,8 @@ if check_password(st):
                     st.markdown(
                         (
                             "<div class='conn-card'>"
-                            f"<span class='conn-chip'>Source set: {'yes' if str(CONFIG.forwards[i].source).strip() else 'no'}</span>"
+                            f"<span class='conn-chip'>Sources: {len(source_candidates)}</span>"
+                            f"<span class='conn-chip'>Active source set: {'yes' if str(CONFIG.forwards[i].source).strip() else 'no'}</span>"
                             f"<span class='conn-chip'>Destination count: {len(CONFIG.forwards[i].dest)}</span>"
                             "</div>"
                         ),
@@ -1090,7 +1249,7 @@ if check_password(st):
                     )
 
                     if st.button("Display source/destination IDs and names", key=f"resolve-src-dest-{con}"):
-                        peers = [("source", CONFIG.forwards[i].source)] + [
+                        peers = [(f"source-{idx+1}", src) for idx, src in enumerate(source_candidates)] + [
                             ("destination", item) for item in CONFIG.forwards[i].dest
                         ]
                         try:
@@ -1121,7 +1280,63 @@ if check_password(st):
                         )
 
                 with st.expander("Validation, Preview, and Lookup", expanded=True):
-                    validation = _validate_forward(CONFIG.forwards[i])
+                    st.markdown("### Source and Destination Context")
+                    source_labels = _peer_dropdown_labels(source_candidates)
+                    ctx_left, ctx_right = st.columns(2)
+                    with ctx_left:
+                        source_input_mode = st.segmented_control(
+                            "Source channel input",
+                            options=["Dropdown", "Manual input"],
+                            default="Dropdown",
+                            key=f"ctx-source-mode-{con}",
+                        )
+                        if source_input_mode == "Dropdown" and source_candidates:
+                            selected_source = st.selectbox(
+                                "Source channel ID / Username",
+                                options=source_candidates,
+                                index=(source_candidates.index(active_source) if active_source in source_candidates else 0),
+                                format_func=lambda item: source_labels.get(item, item),
+                                key=f"ctx-source-dropdown-{con}",
+                            )
+                        else:
+                            selected_source = st.text_input(
+                                "Source channel ID / Username",
+                                value=active_source,
+                                key=f"ctx-source-manual-{con}",
+                                placeholder="-1001234567890 or channel_username",
+                            ).strip()
+
+                    dest_candidates = [str(item).strip() for item in CONFIG.forwards[i].dest if str(item).strip()]
+                    dest_labels = _peer_dropdown_labels(dest_candidates)
+                    with ctx_right:
+                        dest_input_mode = st.segmented_control(
+                            "Destination channel input",
+                            options=["Dropdown", "Manual input"],
+                            default="Dropdown",
+                            key=f"ctx-dest-mode-{con}",
+                        )
+                        if dest_input_mode == "Dropdown" and dest_candidates:
+                            selected_destination = st.selectbox(
+                                "Destination channel ID / Username",
+                                options=dest_candidates,
+                                format_func=lambda item: dest_labels.get(item, item),
+                                key=f"ctx-dest-dropdown-{con}",
+                            )
+                        else:
+                            selected_destination = st.text_input(
+                                "Destination channel ID / Username",
+                                value=(dest_candidates[0] if dest_candidates else ""),
+                                key=f"ctx-dest-manual-{con}",
+                                placeholder="-1001234567890 or channel_username",
+                            ).strip()
+
+                    scoped_forward = CONFIG.forwards[i].copy(deep=True)
+                    if selected_source:
+                        scoped_forward.source = selected_source
+                    if selected_destination:
+                        scoped_forward.dest = [selected_destination]
+
+                    validation = _validate_forward(scoped_forward)
                     if validation["errors"]:
                         for err in validation["errors"]:
                             st.error(err)
@@ -1133,16 +1348,16 @@ if check_password(st):
                     if st.button("Preview next past-mode message", key=f"preview-next-{con}"):
                         try:
                             with st.spinner("Loading message preview..."):
-                                preview = _run(_preview_next_message(CONFIG.forwards[i]))
+                                preview = _run(_preview_next_message(scoped_forward))
                             src = preview["source"]
                             source_col, targets_col = st.columns(2)
                             with source_col:
                                 st.write("Source")
-                                st.dataframe([src], use_container_width=True)
+                                st.dataframe([src], width="stretch")
                             if preview["targets"]:
                                 with targets_col:
                                     st.write("Targets")
-                                    st.dataframe(preview["targets"], use_container_width=True)
+                                    st.dataframe(preview["targets"], width="stretch")
                             if preview["message"]:
                                 st.write("Message preview")
                                 msg = preview["message"]
@@ -1158,7 +1373,7 @@ if check_password(st):
                                                 "mime_type": msg["media"]["mime_type"],
                                             }
                                         ],
-                                        use_container_width=True,
+                                        width="stretch",
                                     )
                                 with msg_col2:
                                     st.dataframe(
@@ -1170,7 +1385,7 @@ if check_password(st):
                                                 "dimensions": msg["media"]["dimensions"],
                                             }
                                         ],
-                                        use_container_width=True,
+                                        width="stretch",
                                     )
                                 st.text_area(
                                     "Caption/Text preview",
@@ -1184,20 +1399,22 @@ if check_password(st):
                         except Exception as err:
                             st.error(f"Preview failed: {err}")
 
-                    st.markdown("### Destination Lookups")
+                    st.markdown("### Destination Channel Lookup")
                     target_override = get_list(
                         st.text_area(
-                            "Optional target channel/group/person IDs (one per line). Leave empty to use Destinations above.",
+                            "Destination channel ID / Username (one per line). Leave empty to use the destination context above.",
                             key=f"latest-target-input-{con}",
                             placeholder="-1001234567890\nmy_channel_username",
                         )
                     )
-                    if st.button("Get targets and latest message ID", key=f"latest-target-msg-{con}"):
+                    if st.button("Get destination latest message ID", key=f"latest-target-msg-{con}"):
                         try:
-                            with st.spinner("Resolving targets and fetching latest message IDs..."):
-                                temp_forward = CONFIG.forwards[i].copy(deep=True)
+                            with st.spinner("Resolving destination channels and fetching latest message IDs..."):
+                                temp_forward = scoped_forward.copy(deep=True)
                                 if target_override:
                                     temp_forward.dest = target_override
+                                elif selected_destination:
+                                    temp_forward.dest = [selected_destination]
                                 latest_rows = _run(_latest_target_messages(temp_forward))
                             st.session_state[f"latest-target-rows-{con}"] = latest_rows
                             st.session_state[f"latest-target-error-{con}"] = ""
@@ -1211,7 +1428,7 @@ if check_password(st):
                         st.error(f"Failed to fetch latest message IDs: {latest_error}")
                     elif latest_rows is not None:
                         if latest_rows:
-                            st.write("Targets with latest message IDs")
+                            st.write("Destination channels with latest message IDs")
                             _render_copyable_table(
                                 latest_rows,
                                 [
@@ -1228,14 +1445,33 @@ if check_password(st):
                             st.warning("No destinations configured.")
 
                     st.markdown("---")
-                    st.write("Get caption/text by target ID and message ID")
-                    target_for_caption = st.text_input(
-                        "Target channel/group/person id",
-                        key=f"caption-target-{con}",
-                        placeholder="-1001234567890 or username",
+                    st.write("Get message caption/text by source or destination")
+                    caption_channel_mode = st.segmented_control(
+                        "Lookup channel input",
+                        options=["Dropdown", "Manual input"],
+                        default="Dropdown",
+                        key=f"caption-channel-mode-{con}",
                     )
+                    caption_channel_options = [item for item in [selected_source, selected_destination] if str(item).strip()]
+                    target_for_caption = ""
+                    if caption_channel_mode == "Dropdown" and caption_channel_options:
+                        caption_labels = _peer_dropdown_labels(caption_channel_options)
+                        target_for_caption = st.selectbox(
+                            "Lookup channel ID / Username",
+                            options=caption_channel_options,
+                            format_func=lambda item: caption_labels.get(item, item),
+                            key=f"caption-target-dropdown-{con}",
+                        )
+                    else:
+                        target_for_caption = st.text_input(
+                            "Lookup channel ID / Username",
+                            key=f"caption-target-manual-{con}",
+                            value=(caption_channel_options[0] if caption_channel_options else ""),
+                            placeholder="-1001234567890 or channel_username",
+                        ).strip()
+
                     message_id_for_caption = st.text_input(
-                        "Message id",
+                        "Message ID",
                         key=f"caption-message-id-{con}",
                         placeholder="12345",
                     )
@@ -1352,59 +1588,9 @@ if check_password(st):
                             )
 
                     st.markdown("---")
-                    st.markdown("### Search Dialogs")
-                    search_query = st.text_input(
-                        "Search channel/group/person by name",
-                        key=f"search-name-{con}",
-                        placeholder="Enter part of name or username",
-                    )
-                    results_key = f"search-name-results-{con}"
-                    error_key = f"search-name-error-{con}"
-                    query_key = f"search-name-last-query-{con}"
-                    if st.button("Search by name", key=f"search-name-btn-{con}"):
-                        try:
-                            with st.spinner("Searching dialogs by name..."):
-                                results = _run(_search_peers(search_query))
-                            st.session_state[results_key] = results
-                            st.session_state[error_key] = ""
-                            st.session_state[query_key] = search_query
-                        except Exception as err:
-                            st.session_state[results_key] = []
-                            st.session_state[error_key] = str(err)
-                            st.session_state[query_key] = search_query
-
-                    last_results = st.session_state.get(results_key)
-                    last_error = st.session_state.get(error_key, "")
-                    last_query = st.session_state.get(query_key, "")
-                    if last_error:
-                        st.error(f"Search failed: {last_error}")
-                    elif last_results is not None:
-                        if last_results:
-                            if str(last_query).strip():
-                                st.caption(f"Showing latest results for: {last_query}")
-                            _render_copyable_table(
-                                last_results,
-                                [
-                                    {"field": "id", "label": "ID"},
-                                    {"field": "name", "label": "Name"},
-                                    {"field": "username", "label": "Username"},
-                                    {"field": "type", "label": "Type"},
-                                ],
-                                key=f"search_results_{con}",
-                            )
-                            st.caption("Use the id value from results as source/destination.")
-                        else:
-                            st.warning("No matches found.")
-
-                    st.markdown("---")
-                    st.markdown("### Search Messages By Text")
-                    msg_search_target = st.text_input(
-                        "Target ID for text search",
-                        key=f"msg-search-target-{con}",
-                        placeholder="-1001234567890 or username",
-                    )
+                    st.markdown("### Search Messages by Source and Destination")
                     msg_search_text = st.text_input(
-                        "Search string",
+                        "Search text",
                         key=f"msg-search-text-{con}",
                         placeholder="#Cat",
                     )
@@ -1419,20 +1605,38 @@ if check_password(st):
                         )
                     )
 
-                    if st.button("Search message by string", key=f"msg-search-btn-{con}"):
-                        try:
-                            with st.spinner("Searching messages in target..."):
-                                msg_search_result = _run(
-                                    _search_messages_by_text(
-                                        msg_search_target,
-                                        msg_search_text,
-                                        limit=msg_search_limit,
+                    search_src_col, search_dst_col = st.columns(2)
+                    with search_src_col:
+                        if st.button("Search in source channel", key=f"msg-search-src-btn-{con}"):
+                            try:
+                                with st.spinner("Searching messages in source channel..."):
+                                    msg_search_result = _run(
+                                        _search_messages_by_text(
+                                            selected_source,
+                                            msg_search_text,
+                                            limit=msg_search_limit,
+                                        )
                                     )
-                                )
-                            st.session_state[f"msg-search-result-{con}"] = msg_search_result
-                            st.session_state[f"msg-search-error-{con}"] = ""
-                        except Exception as err:
-                            st.session_state[f"msg-search-error-{con}"] = str(err)
+                                st.session_state[f"msg-search-result-{con}"] = msg_search_result
+                                st.session_state[f"msg-search-error-{con}"] = ""
+                            except Exception as err:
+                                st.session_state[f"msg-search-error-{con}"] = str(err)
+
+                    with search_dst_col:
+                        if st.button("Search in destination channel", key=f"msg-search-dst-btn-{con}"):
+                            try:
+                                with st.spinner("Searching messages in destination channel..."):
+                                    msg_search_result = _run(
+                                        _search_messages_by_text(
+                                            selected_destination,
+                                            msg_search_text,
+                                            limit=msg_search_limit,
+                                        )
+                                    )
+                                st.session_state[f"msg-search-result-{con}"] = msg_search_result
+                                st.session_state[f"msg-search-error-{con}"] = ""
+                            except Exception as err:
+                                st.session_state[f"msg-search-error-{con}"] = str(err)
 
                     msg_search_error = st.session_state.get(f"msg-search-error-{con}", "")
                     if msg_search_error:
@@ -1442,7 +1646,7 @@ if check_password(st):
                     if msg_search_result:
                         rows = msg_search_result.get("rows", [])
                         st.caption(
-                            f"Target: {msg_search_result['target_name']} ({msg_search_result['target_id']}) | "
+                            f"Channel: {msg_search_result['target_name']} ({msg_search_result['target_id']}) | "
                             f"Query: {msg_search_result['query']} | Results: {len(rows)}"
                         )
                         if rows:
@@ -1465,7 +1669,88 @@ if check_password(st):
                                 key=f"msg-search-top-full-{con}-{rows[0].get('message_id', '-')}",
                             )
                         else:
-                            st.warning("No messages found for this string.")
+                            st.warning("No messages found for this search text.")
+
+                    st.markdown("---")
+                    st.markdown("### Export Source Channel")
+                    st.caption("Export all messages from the selected source channel to a CSV file.")
+                    export_state_key = f"channel-export-result-{con}"
+                    export_error_key = f"channel-export-error-{con}"
+                    if st.button("Export source channel messages to CSV", key=f"export-channel-csv-{con}"):
+                        try:
+                            with st.spinner("Exporting channel messages..."):
+                                export_result = _run(
+                                    _export_channel_messages_to_csv(active_source)
+                                )
+                            st.session_state[export_state_key] = export_result
+                            st.session_state[export_error_key] = ""
+                        except Exception as err:
+                            st.session_state[export_state_key] = None
+                            st.session_state[export_error_key] = str(err)
+
+                    export_error = st.session_state.get(export_error_key, "")
+                    if export_error:
+                        st.error(f"Export failed: {export_error}")
+
+                    export_result = st.session_state.get(export_state_key)
+                    if export_result:
+                        st.success(
+                            f"Exported {export_result['message_count']} messages from {export_result.get('channel_name', export_result.get('source_name', '-'))}"
+                        )
+                        export_path = Path(export_result["file_path"])
+                        if export_path.exists():
+                            st.download_button(
+                                "Download exported CSV",
+                                data=export_path.read_bytes(),
+                                file_name=export_result["file_name"],
+                                mime="text/csv",
+                                key=f"download-channel-csv-{con}",
+                            )
+
+                    st.markdown("### Export Destination Channel")
+                    st.caption("Export all messages from the selected destination channel to a CSV file.")
+
+                    export_dest_state_key = f"dest-channel-export-result-{con}"
+                    export_dest_error_key = f"dest-channel-export-error-{con}"
+
+                    chosen_dest = str(selected_destination or "").strip()
+                    if not chosen_dest:
+                        st.caption("No destination channel is selected.")
+
+                    if st.button("Export destination channel messages to CSV", key=f"export-dest-channel-csv-{con}"):
+                        if not chosen_dest:
+                            st.session_state[export_dest_state_key] = None
+                            st.session_state[export_dest_error_key] = "No destination channel selected."
+                        else:
+                            try:
+                                with st.spinner("Exporting destination channel messages..."):
+                                    export_dest_result = _run(
+                                        _export_channel_messages_to_csv(chosen_dest)
+                                    )
+                                st.session_state[export_dest_state_key] = export_dest_result
+                                st.session_state[export_dest_error_key] = ""
+                            except Exception as err:
+                                st.session_state[export_dest_state_key] = None
+                                st.session_state[export_dest_error_key] = str(err)
+
+                    export_dest_error = st.session_state.get(export_dest_error_key, "")
+                    if export_dest_error:
+                        st.error(f"Destination export failed: {export_dest_error}")
+
+                    export_dest_result = st.session_state.get(export_dest_state_key)
+                    if export_dest_result:
+                        st.success(
+                            f"Exported {export_dest_result['message_count']} messages from destination {export_dest_result.get('channel_name', export_dest_result.get('source_name', '-'))}"
+                        )
+                        export_dest_path = Path(export_dest_result["file_path"])
+                        if export_dest_path.exists():
+                            st.download_button(
+                                "Download destination CSV",
+                                data=export_dest_path.read_bytes(),
+                                file_name=export_dest_result["file_name"],
+                                mime="text/csv",
+                                key=f"download-dest-channel-csv-{con}",
+                            )
 
                 with st.expander("Past Mode Settings", expanded=False):
                     CONFIG.forwards[i].offset = int(
