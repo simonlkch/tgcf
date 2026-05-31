@@ -219,6 +219,30 @@ async def _connect_client() -> TelegramClient:
     return client
 
 
+async def _connect_user_client() -> TelegramClient:
+    """Connect using the user session string only (never bot token)."""
+    login = CONFIG.login
+    if not login.API_ID or not login.API_HASH:
+        raise ValueError("API_ID/API_HASH is missing. Configure Telegram Login first.")
+
+    session = None
+    if login.sessions and 0 <= login.active_session < len(login.sessions):
+        sess = login.sessions[login.active_session].session_string
+        if sess:
+            session = StringSession(sess)
+    if session is None and login.SESSION_STRING:
+        session = StringSession(login.SESSION_STRING)
+    if session is None:
+        raise ValueError("No user session found. Please login on Telegram Login page first.")
+
+    client = TelegramClient(session, login.API_ID, login.API_HASH)
+    await client.connect()
+    if not await client.is_user_authorized():
+        await client.disconnect()
+        raise ValueError("User session is not authorized. Re-login from Telegram Login page.")
+    return client
+
+
 def _entity_name(entity) -> str:
     title = getattr(entity, "title", None)
     if title:
@@ -327,7 +351,7 @@ async def _search_peers(query: str, limit: int = 30) -> List[Dict[str, Any]]:
     if not q:
         return []
 
-    client = await _connect_client()
+    client = await _connect_user_client()
     try:
         found: List[Dict[str, Any]] = []
         async for dialog in client.iter_dialogs():
@@ -1055,6 +1079,61 @@ if check_password(st):
     if save_top:
         write_config(CONFIG)
         st.rerun()
+
+    with st.expander("🔍 Channel Search", expanded=False):
+        st.markdown("Search your Telegram dialogs by name, username, or ID keyword.")
+        search_col, limit_col = st.columns([3, 1])
+        with search_col:
+            channel_search_query = st.text_input(
+                "Search query",
+                key="global-channel-search-query",
+                placeholder="e.g. news, @mychannel, 1234567890",
+            )
+        with limit_col:
+            channel_search_limit = int(
+                st.number_input(
+                    "Max results",
+                    min_value=1,
+                    max_value=200,
+                    value=30,
+                    step=1,
+                    key="global-channel-search-limit",
+                )
+            )
+        if st.button("Search channels", key="global-channel-search-btn"):
+            if not channel_search_query.strip():
+                st.session_state["global-channel-search-error"] = "Please enter a search query."
+                st.session_state["global-channel-search-rows"] = []
+            else:
+                try:
+                    with st.spinner("Searching dialogs..."):
+                        found = _run(_search_peers(channel_search_query, limit=channel_search_limit))
+                    st.session_state["global-channel-search-rows"] = found
+                    st.session_state["global-channel-search-error"] = ""
+                except Exception as err:
+                    st.session_state["global-channel-search-rows"] = []
+                    st.session_state["global-channel-search-error"] = str(err)
+
+        search_error = st.session_state.get("global-channel-search-error", "")
+        if search_error:
+            st.error(search_error)
+        search_rows = st.session_state.get("global-channel-search-rows")
+        if search_rows is not None:
+            if search_rows:
+                st.caption(f"Found {len(search_rows)} result(s). Click any cell to copy.")
+                _render_copyable_table(
+                    search_rows,
+                    [
+                        {"field": "id", "label": "ID"},
+                        {"field": "name", "label": "Name"},
+                        {"field": "username", "label": "Username"},
+                        {"field": "type", "label": "Type"},
+                    ],
+                    key="global_channel_search",
+                    min_height=160,
+                )
+            else:
+                st.info("No dialogs matched your query.")
 
     with st.expander("Past Resume Settings", expanded=False):
         current_resume_setting = bool(
