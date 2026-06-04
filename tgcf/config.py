@@ -29,6 +29,8 @@ class Forward(BaseModel):
     use_this: bool = True
     source: Union[int, str] = ""
     dest: List[Union[int, str]] = []
+    download_session_name: str = ""
+    upload_session_name: str = ""
     offset: int = 0
     end: Optional[int] = 0
 
@@ -202,7 +204,9 @@ async def load_from_to(
     -> Chat ids are essential for how storage is implemented
     -> Storage is essential for edit, delete and reply syncs
     """
+    global forward_by_source
     from_to_dict = {}
+    forward_by_source = {}
 
     async def _(peer):
         # Keep numeric IDs untouched (e.g. -100... channel IDs).
@@ -219,6 +223,7 @@ async def load_from_to(
             continue
         src = await _(forward.source)
         from_to_dict[src] = [await _(dest) for dest in forward.dest]
+        forward_by_source[src] = forward
     logging.info(f"From to dict is {from_to_dict}")
     return from_to_dict
 
@@ -265,6 +270,7 @@ if PASSWORD == "tgcf":
         "You have not set a password to protect the web access to tgcf.\nThe default password `tgcf` is used."
     )
 from_to = {}
+forward_by_source: Dict[int, Forward] = {}
 is_bot: Optional[bool] = None
 logging.info("config.py got executed")
 
@@ -290,3 +296,24 @@ def get_SESSION(section: Any = CONFIG.login, default: str = 'tgcf_bot'):
         logging.warning("Login information not set!")
         sys.exit()
     return SESSION
+
+
+def get_session_for_name(session_name: str, default: str = "tgcf_user"):
+    """Return a user session by name, with fallback to active session."""
+
+    section = CONFIG.login
+    if section.user_type != 1:
+        return get_SESSION(section=section, default=default)
+
+    wanted_name = (session_name or "").strip().casefold()
+    if not wanted_name:
+        return get_SESSION(section=section, default=default)
+
+    for sess in section.sessions:
+        sess_name = (sess.name or "").strip().casefold()
+        if sess_name == wanted_name and sess.session_string:
+            logging.info("using named session '%s'", sess.name)
+            return StringSession(sess.session_string)
+
+    logging.warning("named session '%s' not found; fallback to active session", session_name)
+    return get_SESSION(section=section, default=default)

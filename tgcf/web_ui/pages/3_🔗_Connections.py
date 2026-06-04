@@ -346,6 +346,17 @@ def _peer_dropdown_labels(peers: List[str]) -> Dict[str, str]:
     return labels
 
 
+def _available_session_names() -> List[str]:
+    names: List[str] = []
+    for idx, sess in enumerate(CONFIG.login.sessions):
+        raw_name = str(getattr(sess, "name", "") or "").strip()
+        if raw_name:
+            names.append(raw_name)
+        else:
+            names.append(f"Session {idx + 1}")
+    return names
+
+
 async def _search_peers(query: str, limit: int = 30) -> List[Dict[str, Any]]:
     q = (query or "").strip().lower()
     if not q:
@@ -399,6 +410,14 @@ def _validate_forward(forward: Forward) -> Dict[str, List[str]]:
 
     if len(dest) != len(set(dest)):
         warnings.append("Duplicate destinations found.")
+
+    session_names = _available_session_names()
+    download_session_name = (getattr(forward, "download_session_name", "") or "").strip()
+    upload_session_name = (getattr(forward, "upload_session_name", "") or "").strip()
+    if download_session_name and download_session_name not in session_names:
+        warnings.append(f"Download session '{download_session_name}' is not found in Telegram Login sessions.")
+    if upload_session_name and upload_session_name not in session_names:
+        warnings.append(f"Upload session '{upload_session_name}' is not found in Telegram Login sessions.")
 
     return {"errors": errors, "warnings": warnings}
 
@@ -1316,12 +1335,44 @@ if check_password(st):
                     )
                     st.caption("Write destinations one item per line.")
 
+                    session_choices = [""] + _available_session_names()
+                    current_download_name = (getattr(CONFIG.forwards[i], "download_session_name", "") or "").strip()
+                    current_upload_name = (getattr(CONFIG.forwards[i], "upload_session_name", "") or "").strip()
+                    download_index = session_choices.index(current_download_name) if current_download_name in session_choices else 0
+                    upload_index = session_choices.index(current_upload_name) if current_upload_name in session_choices else 0
+
+                    sess_left, sess_right = st.columns(2)
+                    with sess_left:
+                        selected_download_session = st.selectbox(
+                            "Download session (optional)",
+                            options=session_choices,
+                            index=download_index,
+                            key=f"download-session-{con}",
+                            format_func=lambda value: value if value else "Use runtime source session",
+                            help="Use this user session when reading/downloading source media for this connection.",
+                        )
+                    with sess_right:
+                        selected_upload_session = st.selectbox(
+                            "Upload session (optional)",
+                            options=session_choices,
+                            index=upload_index,
+                            key=f"upload-session-{con}",
+                            format_func=lambda value: value if value else "Use runtime source session",
+                            help="Use this user session when sending uploaded media for this connection.",
+                        )
+
+                    CONFIG.forwards[i].download_session_name = (selected_download_session or "").strip()
+                    CONFIG.forwards[i].upload_session_name = (selected_upload_session or "").strip()
+                    st.caption("Set account A for download and account B for upload by choosing different sessions here.")
+
                     st.markdown(
                         (
                             "<div class='conn-card'>"
                             f"<span class='conn-chip'>Sources: {len(source_candidates)}</span>"
                             f"<span class='conn-chip'>Active source set: {'yes' if str(CONFIG.forwards[i].source).strip() else 'no'}</span>"
                             f"<span class='conn-chip'>Destination count: {len(CONFIG.forwards[i].dest)}</span>"
+                            f"<span class='conn-chip'>Download session: {(CONFIG.forwards[i].download_session_name or 'default')}</span>"
+                            f"<span class='conn-chip'>Upload session: {(CONFIG.forwards[i].upload_session_name or 'default')}</span>"
                             "</div>"
                         ),
                         unsafe_allow_html=True,

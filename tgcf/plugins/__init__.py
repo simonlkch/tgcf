@@ -184,6 +184,67 @@ class TgcfMessage:
         target_path = os.path.join(temp_dir, cache_name)
         part_path = target_path + ".part"
         meta_path = target_path + ".meta"
+        legacy_raw_base_name = os.path.basename(file_name)
+        legacy_safe_base_name = safe_name(file_name)
+        legacy_part_path = os.path.join(temp_dir, f"{legacy_safe_base_name}.part")
+        legacy_meta_path = os.path.join(temp_dir, f"{legacy_safe_base_name}.meta")
+
+        def _legacy_resume_paths() -> tuple[str, str]:
+            """Find older resume files that were stored without the message-id prefix."""
+
+            candidates = []
+
+            def _matches_legacy_base(stem: str) -> bool:
+                if not stem:
+                    return False
+                normalized_stem = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", stem.lower())
+                raw_norm = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", legacy_raw_base_name.lower())
+                safe_norm = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", legacy_safe_base_name.lower())
+                return (
+                    stem == legacy_raw_base_name
+                    or stem == legacy_safe_base_name
+                    or stem.endswith(f"_{legacy_raw_base_name}")
+                    or stem.endswith(f"_{legacy_safe_base_name}")
+                    or normalized_stem == raw_norm
+                    or normalized_stem == safe_norm
+                    or normalized_stem.endswith(raw_norm)
+                    or normalized_stem.endswith(safe_norm)
+                )
+
+            def _push_candidate(candidate_part: str, candidate_meta: str) -> None:
+                if os.path.exists(candidate_part):
+                    candidates.append((candidate_part, candidate_meta))
+
+            _push_candidate(part_path, meta_path)
+            _push_candidate(legacy_part_path, legacy_meta_path)
+
+            for entry in os.scandir(temp_dir):
+                if not entry.is_file() or not entry.name.endswith(".part"):
+                    continue
+                stem = entry.name[:-5]
+                if _matches_legacy_base(stem):
+                    _push_candidate(entry.path, os.path.join(temp_dir, f"{stem}.meta"))
+
+            if not candidates:
+                return part_path, meta_path
+
+            chosen_part, chosen_meta = max(candidates, key=lambda item: os.path.getmtime(item[0]))
+            return chosen_part, chosen_meta
+
+        def _normalize_reused_blob(file_path: str) -> str:
+            """Move a reused blob to the new prefixed cache path if needed."""
+
+            if not file_path:
+                return file_path
+            abs_path = os.path.abspath(file_path)
+            target_abs = os.path.abspath(target_path)
+            if abs_path == target_abs:
+                return target_path
+            try:
+                os.replace(abs_path, target_abs)
+                return target_path
+            except OSError:
+                return file_path
 
         def _write_resume_meta(offset: int) -> None:
             payload = {
@@ -199,6 +260,15 @@ class TgcfMessage:
                 pass
 
         def _read_resume_offset() -> int:
+            resume_part_path, resume_meta_path = _legacy_resume_paths()
+            if resume_part_path != part_path and os.path.exists(resume_part_path):
+                try:
+                    os.replace(resume_part_path, part_path)
+                    if os.path.exists(resume_meta_path):
+                        os.replace(resume_meta_path, meta_path)
+                except OSError:
+                    pass
+
             offset = os.path.getsize(part_path) if os.path.exists(part_path) else 0
             if offset <= 0:
                 return 0
@@ -229,6 +299,8 @@ class TgcfMessage:
             return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", value.lower())
 
         expected_norm = _normalize_name(file_name)
+        expected_raw_norm = _normalize_name(legacy_raw_base_name)
+        expected_safe_norm = _normalize_name(legacy_safe_base_name)
 
         # Reuse any valid pre-existing blob in temp, including files downloaded by older naming schemes.
         candidates = []
@@ -238,8 +310,10 @@ class TgcfMessage:
             candidate_name = entry.name
             if expected_size is not None and os.path.getsize(entry.path) != expected_size:
                 continue
-            if expected_norm and expected_norm not in _normalize_name(candidate_name):
-                continue
+            candidate_norm = _normalize_name(candidate_name)
+            if expected_norm and expected_norm not in candidate_norm:
+                if expected_raw_norm not in candidate_norm and expected_safe_norm not in candidate_norm:
+                    continue
             if self._is_valid_media_file(entry.path, expected_size):
                 candidates.append(entry.path)
 
@@ -256,7 +330,7 @@ class TgcfMessage:
         if candidates:
             chosen = max(candidates, key=os.path.getmtime)
             logging.info("Reusing existing temp media=%s", self._safe_log_path(chosen))
-            self.new_file = chosen
+            self.new_file = _normalize_reused_blob(chosen)
             await self.ensure_thumb_file()
             self.cleanup = True
             return self.new_file

@@ -72,16 +72,19 @@ async def _send_file_fast_compatible(client: TelegramClient, *args, **kwargs):
             else:
                 label = os.path.basename(getattr(item, "name", "")) or "stream"
             label = str(label).replace("\n", " ").replace("\r", " ").strip()
-            return label or "file"
+            return (label or "file").encode("ascii", errors="backslashreplace").decode("ascii")
 
         def _build_upload_progress_callback(label: str):
             progress_bar = None
             uploaded_bytes = 0
             last_draw_bytes = 0
             started_at = time.time()
+            last_draw_time = started_at
+            min_update_bytes = 2 * 1024 * 1024
+            min_update_seconds = 0.25
 
             async def _callback(current: int, total: int):
-                nonlocal progress_bar, uploaded_bytes, last_draw_bytes
+                nonlocal progress_bar, uploaded_bytes, last_draw_bytes, last_draw_time
                 if progress_bar is None:
                     progress_bar = tqdm(
                         total=total or None,
@@ -96,14 +99,29 @@ async def _send_file_fast_compatible(client: TelegramClient, *args, **kwargs):
                     )
                 if total and progress_bar.total != total:
                     progress_bar.total = total
+                if current < uploaded_bytes:
+                    current = uploaded_bytes
                 delta = current - uploaded_bytes
                 if delta > 0:
                     uploaded_bytes = current
-                    progress_bar.update(delta)
-                elapsed = max(time.time() - started_at, 1e-6)
+                now = time.time()
+                should_draw = (
+                    (uploaded_bytes - last_draw_bytes) >= min_update_bytes
+                    or (now - last_draw_time) >= min_update_seconds
+                    or (total and uploaded_bytes >= total)
+                )
+                if not should_draw:
+                    return
+
+                draw_delta = uploaded_bytes - last_draw_bytes
+                if draw_delta > 0:
+                    progress_bar.update(draw_delta)
+
+                elapsed = max(now - started_at, 1e-6)
                 speed_mbps = (uploaded_bytes / elapsed) / (1024 * 1024)
                 progress_bar.set_postfix_str(f"{speed_mbps:.2f} MB/s", refresh=False)
                 last_draw_bytes = uploaded_bytes
+                last_draw_time = now
                 if progress_callback:
                     maybe_awaitable = progress_callback(current, total)
                     if hasattr(maybe_awaitable, "__await__"):
@@ -226,6 +244,10 @@ def cleanup(*files: str) -> None:
             os.remove(file)
         except FileNotFoundError:
             logging.info(f"File {file} does not exist, so cant delete it.")
+        except PermissionError as err:
+            logging.warning(f"File {file} is locked and could not be deleted yet. {err}")
+        except OSError as err:
+            logging.warning(f"Failed to delete file {file}. {err}")
 
 
 def stamp(file: str, user: str) -> str:

@@ -15,12 +15,13 @@ from tgcf.forwarding import (
 
 
 class DummyMessage:
-    def __init__(self, chat_id, message_id, grouped_id=None):
+    def __init__(self, chat_id, message_id, grouped_id=None, client=None):
         self.chat_id = chat_id
         self.id = message_id
         self.grouped_id = grouped_id
         self.is_reply = False
         self.reply_to_msg_id = None
+        self.client = client
 
 
 class FloodWaitError(Exception):
@@ -34,6 +35,10 @@ class ChatWriteForbiddenError(Exception):
 
 
 class ChatForwardsRestrictedError(Exception):
+    pass
+
+
+class FileReferenceExpiredError(Exception):
     pass
 
 
@@ -57,6 +62,15 @@ class DummyClient:
     async def send_file(self, recipient, file_path, caption=None, reply_to=None):
         self.sent_file_calls.append((recipient, file_path, caption, reply_to))
         return DummySentMessage(777)
+
+
+class RefreshingClient(DummyClient):
+    def __init__(self, refreshed_messages):
+        super().__init__()
+        self.refreshed_messages = refreshed_messages
+
+    async def get_messages(self, chat_id, ids=None):
+        return self.refreshed_messages
 
 
 class DummyTgcfMessage:
@@ -146,6 +160,35 @@ class ForwardingHelpersTest(unittest.TestCase):
         self.assertIn((10, 100), st.stored_albums)
         self.assertIn(1, st.stored_albums[(10, 100)])
         self.assertNotIn(2, st.stored_albums[(10, 100)])
+
+    def test_forward_source_batch_refetches_when_file_reference_expires(self):
+        st.stored.clear()
+        st.stored_albums.clear()
+
+        refreshed_message = DummyMessage(10, 1)
+        refreshed_client = RefreshingClient([refreshed_message])
+        source_message = DummyMessage(10, 1, client=refreshed_client)
+
+        call_count = 0
+
+        async def fake_forward_batch_with_retry(recipient, messages, reply_to=None):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise FileReferenceExpiredError(
+                    "The file reference has expired and is no longer valid"
+                )
+            self.assertIs(messages[0], refreshed_message)
+            return [DummySentMessage(201)]
+
+        with patch("tgcf.forwarding.forward_batch_with_retry", side_effect=fake_forward_batch_with_retry):
+            import asyncio
+
+            asyncio.run(forward_source_batch([source_message], [1]))
+
+        self.assertEqual(call_count, 2)
+        event_uid = st.EventUid(type("E", (), {"chat_id": 10, "id": 1})())
+        self.assertIn(1, st.stored[event_uid])
 
     def test_send_batch_reuploads_when_protected_chat_blocks_media_copy(self):
         from tgcf.config import CONFIG

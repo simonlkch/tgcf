@@ -13,36 +13,63 @@ from tgcf.web_ui.utils import apply_page_chrome, hide_st, switch_theme
 
 CONFIG = read_config()
 
+PROGRESS_LABEL_RE = re.compile(r"((?:download|upload)[^:]{0,140}):\s*(\d{1,3})%", re.IGNORECASE)
+SIZE_RE = re.compile(r"\|\s*([0-9.]+[KMGT]?)/([0-9.]+[KMGT]?)")
+SPEED_RE = re.compile(r"([0-9.]+)\s*([KMG]?)B/s")
+
+
+def _iter_log_segments(log_lines):
+    """Yield log pieces split by both newline and carriage-return boundaries."""
+
+    for raw_line in log_lines:
+        for segment in str(raw_line).split("\r"):
+            text = segment.strip()
+            if text:
+                yield text
+
+
+def _parse_progress_line(line: str):
+    if "download" not in line.lower() and "upload" not in line.lower():
+        return None
+
+    progress_match = PROGRESS_LABEL_RE.search(line)
+    if not progress_match:
+        return None
+
+    label = progress_match.group(1).strip()
+    percent = int(progress_match.group(2))
+    size_match = SIZE_RE.search(line)
+    speed_match = SPEED_RE.search(line)
+    speed_mb_s = None
+    if speed_match:
+        value = float(speed_match.group(1))
+        unit = (speed_match.group(2) or "").upper()
+        factor = {"": 1 / (1024 * 1024), "K": 1 / 1024, "M": 1.0, "G": 1024.0}.get(unit, 1.0)
+        speed_mb_s = value * factor
+
+    lower_label = label.lower()
+    direction = "download" if lower_label.startswith("download") else "upload"
+    msg_id_match = re.search(r"download\s+msg\s+(\d+)", lower_label)
+
+    return {
+        "direction": direction,
+        "label": label,
+        "message_id": int(msg_id_match.group(1)) if msg_id_match else None,
+        "percent": percent,
+        "size": f"{size_match.group(1)}/{size_match.group(2)}" if size_match else "",
+        "speed_mb_s": speed_mb_s,
+        "line": line.strip(),
+    }
+
 
 def _extract_progress(log_lines):
     """Extract latest transfer progress line produced by tqdm."""
 
-    for line in reversed(log_lines):
-        if "download msg" not in line and "upload " not in line:
-            continue
-        progress_match = re.search(r"(download msg\s+\d+|upload\s+[^:]+):\s*(\d+)%", line)
-        if not progress_match:
-            continue
-        size_match = re.search(r"\|\s*([0-9.]+[KMG]?)/([0-9.]+[KMG]?)", line)
-        speed_match = re.search(r"([0-9.]+)\s*([KMG]?)B/s", line)
-        speed_mb_s = None
-        if speed_match:
-            value = float(speed_match.group(1))
-            unit = (speed_match.group(2) or "").upper()
-            factor = {"": 1 / (1024 * 1024), "K": 1 / 1024, "M": 1.0, "G": 1024.0}.get(unit, 1.0)
-            speed_mb_s = value * factor
-        label = progress_match.group(1)
-        direction = "download" if label.startswith("download msg") else "upload"
-        msg_id_match = re.search(r"download msg\s+(\d+)", label)
-        return {
-            "direction": direction,
-            "label": label,
-            "message_id": int(msg_id_match.group(1)) if msg_id_match else None,
-            "percent": int(progress_match.group(2)),
-            "size": f"{size_match.group(1)}/{size_match.group(2)}" if size_match else "",
-            "speed_mb_s": speed_mb_s,
-            "line": line.strip(),
-        }
+    segments = list(_iter_log_segments(log_lines))
+    for line in reversed(segments):
+        parsed = _parse_progress_line(line)
+        if parsed:
+            return parsed
     return None
 
 
@@ -58,21 +85,15 @@ def _extract_progress_history(log_lines, limit=200):
     history = []
     download_mb_s = 0.0
     upload_mb_s = 0.0
-    for line in log_lines:
-        if "download msg" not in line and "upload " not in line:
+    for line in _iter_log_segments(log_lines):
+        parsed = _parse_progress_line(line)
+        if not parsed:
             continue
-        progress_match = re.search(r"(download msg\s+\d+|upload\s+[^:]+):\s*(\d+)%", line)
-        if not progress_match:
+        speed_mb_s = parsed.get("speed_mb_s")
+        if speed_mb_s is None:
             continue
-        speed_match = re.search(r"([0-9.]+)\s*([KMG]?)B/s", line)
-        if not speed_match:
-            continue
-        value = float(speed_match.group(1))
-        unit = (speed_match.group(2) or "").upper()
-        factor = {"": 1 / (1024 * 1024), "K": 1 / 1024, "M": 1.0, "G": 1024.0}.get(unit, 1.0)
-        speed_mb_s = value * factor
 
-        if progress_match.group(1).startswith("download msg"):
+        if parsed["direction"] == "download":
             download_mb_s = speed_mb_s
         else:
             upload_mb_s = speed_mb_s

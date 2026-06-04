@@ -23,6 +23,7 @@ MAX_FLOOD_WAIT_RETRIES = 10
 FAST_SEND_FILE_PART_SIZE_KB = 1024
 FORWARD_RESTRICTED_PAIRS = set()
 LOGGER = logging.getLogger(__name__)
+UPLOAD_SESSION_CLIENTS: dict[str, TelegramClient] = {}
 
 
 def _preview_text(text: Optional[str], limit: int = 120) -> str:
@@ -141,6 +142,12 @@ def is_chat_forwards_restricted_error(err: Exception) -> bool:
     return err_name == "ChatForwardsRestrictedError" or "FORWARDS_RESTRICTED" in err_text
 
 
+def is_file_reference_expired_error(err: Exception) -> bool:
+    err_name = err.__class__.__name__
+    err_text = str(err).upper()
+    return err_name == "FileReferenceExpiredError" or "FILE_REFERENCE_EXPIRED" in err_text
+
+
 def is_permission_error(err: Exception) -> bool:
     err_name = err.__class__.__name__
     err_text = str(err).upper()
@@ -162,6 +169,80 @@ def is_retryable_error(err: Exception) -> bool:
     if is_permission_error(err):
         return False
     return True
+
+
+async def _refresh_messages_for_forwarding(messages: List[Message]) -> List[Message]:
+    """Refetch source messages so expired file references can be recreated."""
+
+    if not messages:
+        return messages
+
+    first_message = messages[0]
+    client = getattr(first_message, "client", None)
+    source_chat_id = getattr(first_message, "chat_id", None)
+    message_ids = [getattr(message, "id", None) for message in messages]
+    if client is None or source_chat_id is None or any(message_id is None for message_id in message_ids):
+        return messages
+
+    refreshed = await client.get_messages(source_chat_id, ids=message_ids)
+    if not refreshed:
+        return messages
+    if not isinstance(refreshed, list):
+        refreshed = [refreshed]
+
+    refreshed_by_id = {message.id: message for message in refreshed if getattr(message, "id", None) is not None}
+    rebuilt = [refreshed_by_id.get(message_id, message) for message, message_id in zip(messages, message_ids)]
+    return rebuilt
+
+
+def _route_sessions_for_pair(source_chat_id: Optional[int], recipient: int) -> tuple[str, str]:
+    """Return configured (download_session_name, upload_session_name) for a source/destination pair."""
+
+    from tgcf import config
+
+    if source_chat_id is None:
+        return "", ""
+
+    configured = config.forward_by_source.get(source_chat_id)
+    if configured:
+        resolved_destinations = config.from_to.get(source_chat_id, [])
+        if recipient in resolved_destinations:
+            return (
+                (getattr(configured, "download_session_name", "") or "").strip(),
+                (getattr(configured, "upload_session_name", "") or "").strip(),
+            )
+
+    return "", ""
+
+
+async def _get_upload_client(upload_session_name: str, source_client: TelegramClient) -> TelegramClient:
+    """Resolve upload client from a configured session name; fallback to source client."""
+
+    from tgcf.config import CONFIG, get_session_for_name
+
+    name = (upload_session_name or "").strip()
+    if not name:
+        return source_client
+    if CONFIG.login.user_type != 1:
+        return source_client
+
+    key = name.casefold()
+    cached = UPLOAD_SESSION_CLIENTS.get(key)
+    if cached:
+        if not cached.is_connected():
+            await cached.connect()
+        if await cached.is_user_authorized():
+            return cached
+        UPLOAD_SESSION_CLIENTS.pop(key, None)
+
+    session = get_session_for_name(name, default=f"tgcf_upload_{key}")
+    client = TelegramClient(session, CONFIG.login.API_ID, CONFIG.login.API_HASH)
+    await client.connect()
+    if not await client.is_user_authorized():
+        await client.disconnect()
+        raise ValueError(f"Upload session '{name}' is not authorized")
+    UPLOAD_SESSION_CLIENTS[key] = client
+    return client
 
 
 async def forward_source_batch(messages: List[Message], destinations: List[int]):
@@ -186,41 +267,62 @@ async def forward_source_batch(messages: List[Message], destinations: List[int])
     grouped_id = getattr(ordered_messages[0], "grouped_id", None)
     album_uid = st.album_key(source_chat_id, grouped_id)
     for dest in destinations:
-        start_ts = time.perf_counter()
-        wide_event = {
-            "event": "forward_source_batch",
-            "source_chat_id": source_chat_id,
-            "grouped_id": grouped_id,
-            "is_album": grouped_id is not None,
-            "message_count": len(ordered_messages),
-            "destination_count": len(destinations),
-            "destination_chat_id": dest,
-            "first_caption_preview": _message_preview(ordered_messages[0]),
-            "album_atomic": bool(CONFIG.live.album_atomic),
-            "forward_from_enabled": bool(CONFIG.show_forwarded_from),
-        }
-        reply_to = None
-        updated_event_uids = []
-        for source_message in ordered_messages:
-            if not getattr(source_message, "is_reply", False):
-                continue
-            r_event = st.DummyEvent(
-                source_chat_id, getattr(source_message, "reply_to_msg_id", None)
-            )
-            r_event_uid = st.EventUid(r_event)
-            previous = st.stored.get(r_event_uid, {}).get(dest)
-            if previous:
-                reply_to = getattr(previous, "id", None)
-                break
-        wide_event["reply_to_message_id"] = reply_to
-
         sent_messages = []
         try:
-            sent_messages = await forward_batch_with_retry(
-                dest,
-                ordered_messages,
-                reply_to=reply_to,
-            )
+            start_ts = time.perf_counter()
+            wide_event = {
+                "event": "forward_source_batch",
+                "source_chat_id": source_chat_id,
+                "grouped_id": grouped_id,
+                "is_album": grouped_id is not None,
+                "message_count": len(ordered_messages),
+                "destination_count": len(destinations),
+                "destination_chat_id": dest,
+                "first_caption_preview": _message_preview(ordered_messages[0]),
+                "album_atomic": bool(CONFIG.live.album_atomic),
+                "forward_from_enabled": bool(CONFIG.show_forwarded_from),
+            }
+            reply_to = None
+            updated_event_uids = []
+            for source_message in ordered_messages:
+                if not getattr(source_message, "is_reply", False):
+                    continue
+                r_event = st.DummyEvent(
+                    source_chat_id, getattr(source_message, "reply_to_msg_id", None)
+                )
+                r_event_uid = st.EventUid(r_event)
+                previous = st.stored.get(r_event_uid, {}).get(dest)
+                if previous:
+                    reply_to = getattr(previous, "id", None)
+                    break
+            wide_event["reply_to_message_id"] = reply_to
+
+            async def _forward_with_refetch_retry():
+                try:
+                    return await forward_batch_with_retry(
+                        dest,
+                        ordered_messages,
+                        reply_to=reply_to,
+                    )
+                except Exception as err:
+                    if not is_file_reference_expired_error(err):
+                        raise
+                    refreshed_messages = await _refresh_messages_for_forwarding(ordered_messages)
+                    if refreshed_messages == ordered_messages:
+                        raise
+                    logging.warning(
+                        "file reference expired while forwarding source=%s recipient=%s; refetching messages and retrying",
+                        source_chat_id,
+                        dest,
+                    )
+                    return await forward_batch_with_retry(
+                        dest,
+                        refreshed_messages,
+                        reply_to=reply_to,
+                    )
+
+            sent_messages = await _forward_with_refetch_retry()
+
             if not sent_messages:
                 wide_event["outcome"] = "no_outgoing_messages"
                 wide_event["sent_count"] = 0
@@ -383,24 +485,12 @@ async def send_batch(
 
     from tgcf.config import CONFIG
     from tgcf.plugins import apply_plugins
-    from tgcf.utils import cleanup, send_message
+    from tgcf.utils import cleanup, get_temp_dir, safe_name, send_message
 
     transformed = []
     fallback_downloaded_files: List[str] = []
+    uploaded_temp_files: set[str] = set()
     downloaded_media_cache = downloaded_media_cache or {}
-
-    async def _get_downloaded_file(tm):
-        message_id = int(getattr(tm.message, "id", 0) or 0)
-        cached = downloaded_media_cache.get(message_id)
-        if cached and os.path.exists(cached):
-            return cached
-
-        file_path = await tm.get_file()
-        if file_path:
-            fallback_downloaded_files.append(file_path)
-            if message_id:
-                downloaded_media_cache[message_id] = file_path
-        return file_path
 
     try:
         for message in messages:
@@ -412,8 +502,101 @@ async def send_batch(
         client: TelegramClient = transformed[0].client
         source_chat_id = getattr(transformed[0].message, "chat_id", None)
         restricted_pair = (source_chat_id, recipient)
+        route_download_session_name, route_upload_session_name = _route_sessions_for_pair(
+            source_chat_id,
+            recipient,
+        )
+        download_client = await _get_upload_client(route_download_session_name, client)
+        upload_client = await _get_upload_client(route_upload_session_name, client)
+        effective_download_session = route_download_session_name or "(source client session)"
+        effective_upload_session = route_upload_session_name or "(source client session)"
 
-        if CONFIG.show_forwarded_from and restricted_pair not in FORWARD_RESTRICTED_PAIRS:
+        logging.warning(
+            "transfer sessions source=%s recipient=%s download_session=%s upload_session=%s",
+            source_chat_id,
+            recipient,
+            effective_download_session,
+            effective_upload_session,
+        )
+
+        def _ensure_msg_prefix(file_path: Optional[str], message_id: int) -> Optional[str]:
+            if not file_path:
+                return file_path
+            try:
+                abs_path = os.path.abspath(file_path)
+                base = os.path.basename(abs_path)
+                prefix = f"{message_id}_"
+                if base.startswith(prefix):
+                    return abs_path
+                target_name = prefix + safe_name(base)
+                target_path = os.path.join(temp_root, target_name)
+                if abs_path == target_path:
+                    return abs_path
+                if os.path.exists(target_path):
+                    return target_path
+                os.replace(abs_path, target_path)
+                return target_path
+            except Exception:
+                return file_path
+
+        async def _get_downloaded_file(tm):
+            message_id = int(getattr(tm.message, "id", 0) or 0)
+            cached = downloaded_media_cache.get(message_id)
+            if cached and os.path.exists(cached):
+                return cached
+
+            if download_client is client:
+                file_path = await tm.get_file()
+            else:
+                logging.warning(
+                    "downloading media using routed session source=%s recipient=%s message_id=%s download_session=%s",
+                    source_chat_id,
+                    recipient,
+                    message_id,
+                    effective_download_session,
+                )
+                source_message = await download_client.get_messages(source_chat_id, ids=message_id)
+                if not source_message:
+                    raise ValueError(
+                        f"Download session could not fetch source message {message_id} from {source_chat_id}"
+                    )
+                file_path = await download_client.download_media(source_message, file=get_temp_dir())
+
+            if file_path:
+                file_path = _ensure_msg_prefix(file_path, message_id)
+                fallback_downloaded_files.append(file_path)
+                if message_id:
+                    downloaded_media_cache[message_id] = file_path
+            return file_path
+
+        temp_root = os.path.abspath(get_temp_dir())
+
+        def _remember_temp_upload_file(file_path: Optional[str]) -> None:
+            if not file_path:
+                return
+            try:
+                abs_path = os.path.abspath(file_path)
+                if os.path.commonpath([abs_path, temp_root]) == temp_root:
+                    uploaded_temp_files.add(abs_path)
+            except Exception:
+                return
+
+        if route_upload_session_name or route_download_session_name:
+            logging.warning(
+                "connection session routing source=%s recipient=%s download_session=%s upload_session=%s",
+                source_chat_id,
+                recipient,
+                effective_download_session,
+                effective_upload_session,
+            )
+
+        if (
+            CONFIG.show_forwarded_from
+            and upload_client is client
+            and download_client is client
+            and source_chat_id is not None
+            and restricted_pair not in FORWARD_RESTRICTED_PAIRS
+        ):
             try:
                 logging.info("send_batch using forward_messages: recipient=%s count=%s", recipient, len(transformed))
                 forwarded = await client.forward_messages(
@@ -439,6 +622,12 @@ async def send_batch(
                     recipient,
                 )
 
+        if CONFIG.show_forwarded_from and (upload_client is not client or download_client is not client):
+            logging.info(
+                "session-routed connection uses copy/re-upload path recipient=%s",
+                recipient,
+            )
+
         if CONFIG.show_forwarded_from and restricted_pair in FORWARD_RESTRICTED_PAIRS:
             logging.info(
                 "known restricted pair source=%s recipient=%s; skipping forward attempt",
@@ -447,6 +636,31 @@ async def send_batch(
             )
 
         async def send_with_media_fallback(tm):
+            if upload_client is not client:
+                if tm.file_type == FileType.NOFILE and not tm.new_file:
+                    return await upload_client.send_message(recipient, tm.text, reply_to=reply_to)
+
+                if not CONFIG.live.forward_fallback_to_reupload:
+                    raise RuntimeError("routed upload requires media fallback but fallback is disabled")
+
+                file_path = tm.new_file or await _get_downloaded_file(tm)
+                _remember_temp_upload_file(file_path)
+                thumb_file = getattr(tm, "thumb_file", None)
+                ensure_thumb = getattr(tm, "ensure_thumb_file", None)
+                if callable(ensure_thumb):
+                    thumb_file = await ensure_thumb()
+                _remember_temp_upload_file(thumb_file)
+                return await _send_file_fast_compatible(
+                    upload_client,
+                    recipient,
+                    file_path,
+                    caption=tm.text,
+                    reply_to=reply_to,
+                    part_size_kb=CONFIG.live.transfer_part_size_kb,
+                    source_media_type=tm.file_type,
+                    thumb=thumb_file,
+                )
+
             try:
                 return await send_message(recipient, tm)
             except Exception as err:
@@ -464,19 +678,22 @@ async def send_batch(
                 )
                 logging.info("Fallback phase: preparing downloadable media for recipient=%s", recipient)
                 file_path = tm.new_file or await _get_downloaded_file(tm)
+                _remember_temp_upload_file(file_path)
                 try:
                     thumb_file = getattr(tm, "thumb_file", None)
                     ensure_thumb = getattr(tm, "ensure_thumb_file", None)
                     if callable(ensure_thumb):
                         thumb_file = await ensure_thumb()
-                    logging.info(
-                        "Fallback phase: uploading media file=%s recipient=%s caption=%s",
+                    _remember_temp_upload_file(thumb_file)
+                    logging.warning(
+                        "Fallback phase: uploading media file=%s recipient=%s upload_session=%s caption=%s",
                         file_path,
                         recipient,
+                        effective_upload_session,
                         _preview_text(tm.text),
                     )
                     sent = await _send_file_fast_compatible(
-                        client,
+                        upload_client,
                         recipient,
                         file_path,
                         caption=tm.text,
@@ -502,7 +719,27 @@ async def send_batch(
                     raise
 
         if not CONFIG.live.forward_fallback_to_reupload:
-            return [await send_message(recipient, tm) for tm in transformed]
+            if upload_client is client:
+                return [await send_message(recipient, tm) for tm in transformed]
+            sent_items = []
+            for tm in transformed:
+                if tm.file_type == FileType.NOFILE and not tm.new_file:
+                    sent_items.append(await upload_client.send_message(recipient, tm.text, reply_to=reply_to))
+                else:
+                    file_path = tm.new_file or await _get_downloaded_file(tm)
+                    _remember_temp_upload_file(file_path)
+                    sent_items.append(
+                        await _send_file_fast_compatible(
+                            upload_client,
+                            recipient,
+                            file_path,
+                            caption=tm.text,
+                            reply_to=reply_to,
+                            part_size_kb=CONFIG.live.transfer_part_size_kb,
+                            source_media_type=tm.file_type,
+                        )
+                    )
+            return sent_items
 
         if len(transformed) == 1:
             logging.info("send_batch single message path for recipient=%s", recipient)
@@ -513,10 +750,13 @@ async def send_batch(
         for tm in transformed:
             captions.append(tm.text)
             if tm.new_file:
+                _remember_temp_upload_file(tm.new_file)
                 file_paths.append(tm.new_file)
                 continue
             if tm.file_type != FileType.NOFILE:
-                file_paths.append(await _get_downloaded_file(tm))
+                file_path = await _get_downloaded_file(tm)
+                _remember_temp_upload_file(file_path)
+                file_paths.append(file_path)
                 continue
             break
         else:
@@ -526,7 +766,7 @@ async def send_batch(
                 len(file_paths),
             )
             uploaded = await _send_file_fast_compatible(
-                client,
+                upload_client,
                 recipient,
                 file_paths,
                 caption=captions,
@@ -542,5 +782,13 @@ async def send_batch(
     finally:
         for tm in transformed:
             tm.clear()
+        if uploaded_temp_files:
+            logging.warning(
+                "cleaning uploaded temp files source=%s recipient=%s file_count=%s",
+                source_chat_id if 'source_chat_id' in locals() else None,
+                recipient,
+                len(uploaded_temp_files),
+            )
+            cleanup(*sorted(uploaded_temp_files))
         if cleanup_downloaded_files and fallback_downloaded_files:
             cleanup(*set(fallback_downloaded_files))
