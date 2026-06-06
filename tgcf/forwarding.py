@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import logging
+import mimetypes
 import os
 import time
 from typing import Iterable, List, Optional
 
 from telethon import TelegramClient
 from telethon.tl.custom.message import Message
+from tqdm import tqdm
 
+from tgcf.fast_transfer import download_file
 from tgcf.logging_utils import log_event
 from tgcf.plugin_models import FileType
 from tgcf.utils import _send_file_fast_compatible
@@ -563,10 +567,21 @@ async def send_batch(
                 started_at = time.time()
                 last_emit_at = started_at
                 last_emit_bytes = 0
+                download_bar = None
 
                 def _routed_download_progress(current: int, total: int) -> None:
-                    nonlocal last_emit_at, last_emit_bytes
+                    nonlocal last_emit_at, last_emit_bytes, download_bar
                     now = time.time()
+                    if download_bar is None and total:
+                        download_bar = tqdm(
+                            total=total,
+                            unit="B",
+                            unit_scale=True,
+                            desc=f"download msg {message_id}",
+                            ascii=True,
+                        )
+                    if download_bar is not None:
+                        download_bar.update(max(0, current - download_bar.n))
                     if (
                         current < total
                         and current - last_emit_bytes < 1024 * 1024
@@ -576,6 +591,8 @@ async def send_batch(
                     elapsed = max(now - started_at, 1e-6)
                     speed_mb_s = (current / elapsed) / (1024 * 1024)
                     percent = round((current / total) * 100, 2) if total else None
+                    if download_bar is not None:
+                        download_bar.set_postfix_str(f"{speed_mb_s:.2f} MB/s")
                     log_event(
                         LOGGER,
                         logging.INFO,
@@ -593,11 +610,74 @@ async def send_batch(
                     last_emit_at = now
                     last_emit_bytes = current
 
-                file_path = await download_client.download_media(
-                    source_message,
-                    file=get_temp_dir(),
-                    progress_callback=_routed_download_progress,
-                )
+                try:
+                    document = getattr(source_message, "document", None)
+                    source_file = getattr(source_message, "file", None)
+                    expected_size = getattr(source_file, "size", None) or getattr(document, "size", None)
+                    if document is not None and expected_size:
+                        file_name = getattr(source_file, "name", None)
+                        if not file_name:
+                            mime_type = getattr(source_file, "mime_type", None) or ""
+                            file_name = f"msg_{message_id}{mimetypes.guess_extension(mime_type) or '.bin'}"
+                        target_path = os.path.join(temp_root, f"{message_id}_{safe_name(file_name)}")
+                        part_path = target_path + ".part"
+                        meta_path = target_path + ".meta"
+
+                        if os.path.exists(target_path) and os.path.getsize(target_path) == expected_size:
+                            file_path = target_path
+                        else:
+                            resume_from = os.path.getsize(part_path) if os.path.exists(part_path) else 0
+                            if resume_from >= expected_size:
+                                resume_from = 0
+                            if resume_from > 0:
+                                logging.warning(
+                                    "resuming routed media download source=%s recipient=%s message_id=%s offset=%s",
+                                    source_chat_id,
+                                    recipient,
+                                    message_id,
+                                    resume_from,
+                                )
+                            mode = "ab" if resume_from > 0 else "wb"
+                            with open(part_path, mode) as fp:
+                                await download_file(
+                                    download_client,
+                                    document,
+                                    fp,
+                                    progress_callback=_routed_download_progress,
+                                    file_size=expected_size,
+                                    part_size_kb=FAST_SEND_FILE_PART_SIZE_KB,
+                                    offset=resume_from,
+                                )
+                            final_size = os.path.getsize(part_path)
+                            with open(meta_path, "w", encoding="utf-8") as meta_fp:
+                                json.dump(
+                                    {
+                                        "offset": final_size,
+                                        "expected_size": expected_size,
+                                        "updated_at": int(time.time()),
+                                        "file_name": file_name,
+                                    },
+                                    meta_fp,
+                                )
+                            if final_size != expected_size:
+                                raise IOError(
+                                    f"Partial routed download size mismatch: {final_size} != {expected_size}"
+                                )
+                            os.replace(part_path, target_path)
+                            try:
+                                os.remove(meta_path)
+                            except OSError:
+                                pass
+                            file_path = target_path
+                    else:
+                        file_path = await download_client.download_media(
+                            source_message,
+                            file=get_temp_dir(),
+                            progress_callback=_routed_download_progress,
+                        )
+                finally:
+                    if download_bar is not None:
+                        download_bar.close()
 
             if file_path:
                 file_path = _ensure_msg_prefix(file_path, message_id)
