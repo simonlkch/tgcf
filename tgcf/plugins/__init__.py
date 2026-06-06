@@ -21,10 +21,12 @@ from telethon.tl.custom.message import Message
 from tqdm import tqdm
 from tgcf.config import CONFIG
 from tgcf.fast_transfer import download_file
+from tgcf.logging_utils import log_event
 from tgcf.plugin_models import FileType, ASYNC_PLUGIN_IDS
 from tgcf.utils import cleanup, get_temp_dir, safe_name
 
 
+LOGGER = logging.getLogger(__name__)
 TRANSFER_PART_SIZE_KB = 1024
 PROGRESS_MIN_UPDATE_SECONDS = 0.25
 PROGRESS_MIN_UPDATE_BYTES = 1024 * 1024
@@ -422,8 +424,9 @@ class TgcfMessage:
                 elapsed = max(now - start_time, 1e-6)
                 speed_bps = downloaded_bytes / elapsed
                 speed_mbps = speed_bps / (1024 * 1024)
-                if total and speed_bps > 0:
-                    eta_seconds = max(total - downloaded_bytes, 0) / speed_bps
+                percent = round((downloaded_bytes / total) * 100, 2) if total else None
+                eta_seconds = max(total - downloaded_bytes, 0) / speed_bps if total and speed_bps > 0 else None
+                if eta_seconds is not None:
                     progress_bar.set_postfix_str(
                         f"{speed_mbps:.2f} MB/s | ETA {eta_seconds:.1f}s",
                         refresh=False,
@@ -433,6 +436,19 @@ class TgcfMessage:
                         f"{speed_mbps:.2f} MB/s",
                         refresh=False,
                     )
+                log_event(
+                    LOGGER,
+                    logging.INFO,
+                    "transfer_progress",
+                    direction="download",
+                    label=f"download msg {getattr(self.message, 'id', None)}",
+                    message_id=getattr(self.message, "id", None),
+                    current_bytes=downloaded_bytes,
+                    total_bytes=total,
+                    percent=percent,
+                    speed_mb_s=round(speed_mbps, 2),
+                    eta_seconds=round(eta_seconds, 1) if eta_seconds is not None else None,
+                )
 
                 last_draw_bytes = downloaded_bytes
                 last_draw_time = now

@@ -560,7 +560,44 @@ async def send_batch(
                     raise ValueError(
                         f"Download session could not fetch source message {message_id} from {source_chat_id}"
                     )
-                file_path = await download_client.download_media(source_message, file=get_temp_dir())
+                started_at = time.time()
+                last_emit_at = started_at
+                last_emit_bytes = 0
+
+                def _routed_download_progress(current: int, total: int) -> None:
+                    nonlocal last_emit_at, last_emit_bytes
+                    now = time.time()
+                    if (
+                        current < total
+                        and current - last_emit_bytes < 1024 * 1024
+                        and now - last_emit_at < 0.5
+                    ):
+                        return
+                    elapsed = max(now - started_at, 1e-6)
+                    speed_mb_s = (current / elapsed) / (1024 * 1024)
+                    percent = round((current / total) * 100, 2) if total else None
+                    log_event(
+                        LOGGER,
+                        logging.INFO,
+                        "transfer_progress",
+                        direction="download",
+                        label=f"download msg {message_id}",
+                        source_chat_id=source_chat_id,
+                        destination_chat_id=recipient,
+                        message_id=message_id,
+                        current_bytes=current,
+                        total_bytes=total,
+                        percent=percent,
+                        speed_mb_s=round(speed_mb_s, 2),
+                    )
+                    last_emit_at = now
+                    last_emit_bytes = current
+
+                file_path = await download_client.download_media(
+                    source_message,
+                    file=get_temp_dir(),
+                    progress_callback=_routed_download_progress,
+                )
 
             if file_path:
                 file_path = _ensure_msg_prefix(file_path, message_id)
@@ -598,15 +635,30 @@ async def send_batch(
             and restricted_pair not in FORWARD_RESTRICTED_PAIRS
         ):
             try:
-                logging.info("send_batch using forward_messages: recipient=%s count=%s", recipient, len(transformed))
+                log_event(
+                    LOGGER,
+                    logging.INFO,
+                    "forward_direct_started",
+                    source_chat_id=source_chat_id,
+                    destination_chat_id=recipient,
+                    message_count=len(transformed),
+                )
                 forwarded = await client.forward_messages(
                     recipient,
                     [tm.message for tm in transformed],
                     reply_to=reply_to,
                 )
-                if isinstance(forwarded, list):
-                    return forwarded
-                return [forwarded]
+                sent_items = forwarded if isinstance(forwarded, list) else [forwarded]
+                log_event(
+                    LOGGER,
+                    logging.INFO,
+                    "forward_direct_succeeded",
+                    source_chat_id=source_chat_id,
+                    destination_chat_id=recipient,
+                    message_count=len(transformed),
+                    sent_count=len(sent_items),
+                )
+                return sent_items
             except Exception as err:
                 if is_chat_forwards_restricted_error(err):
                     FORWARD_RESTRICTED_PAIRS.add(restricted_pair)

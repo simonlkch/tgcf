@@ -1,9 +1,11 @@
+import json
 import os
 import re
 import signal
 import subprocess
 import sys
 import time
+from collections import deque
 
 import streamlit as st
 
@@ -16,6 +18,53 @@ CONFIG = read_config()
 PROGRESS_LABEL_RE = re.compile(r"((?:download|upload)[^:]{0,140}):\s*(\d{1,3})%", re.IGNORECASE)
 SIZE_RE = re.compile(r"\|\s*([0-9.]+[KMGT]?)/([0-9.]+[KMGT]?)")
 SPEED_RE = re.compile(r"([0-9.]+)\s*([KMG]?)B/s")
+MAX_VISIBLE_LOG_LINES = 1000
+
+
+def _read_latest_log_lines(path="logs.txt", limit=MAX_VISIBLE_LOG_LINES):
+    with open(path, "r", encoding="utf8", errors="replace") as file:
+        return list(deque(file, maxlen=limit))
+
+
+def _parse_json_log(line: str):
+    text = str(line).strip()
+    if not text.startswith("{"):
+        return None
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _format_json_log(obj):
+    level = str(obj.get("level") or "").upper()
+    event = obj.get("event") or obj.get("logger") or "log"
+    message = obj.get("message") or obj.get("outcome") or ""
+    fields = []
+    for key in (
+        "source_chat_id",
+        "destination_chat_id",
+        "recipient",
+        "message_id",
+        "message_count",
+        "sent_count",
+        "direction",
+        "percent",
+        "speed_mb_s",
+        "duration_ms",
+    ):
+        if key in obj and obj.get(key) is not None:
+            fields.append(f"{key}={obj.get(key)}")
+    prefix = f"{level} " if level else ""
+    return f"{prefix}{event}: {message} {' '.join(fields)}".strip()
+
+
+def _display_log_line(line: str) -> str:
+    obj = _parse_json_log(line)
+    if obj:
+        return _format_json_log(obj) + "\n"
+    return line if line.endswith("\n") else line + "\n"
 
 
 def _iter_log_segments(log_lines):
@@ -63,21 +112,41 @@ def _parse_progress_line(line: str):
 
 
 def _extract_progress(log_lines):
-    """Extract latest transfer progress line produced by tqdm."""
+    """Extract latest transfer progress from structured logs or tqdm output."""
 
-    segments = list(_iter_log_segments(log_lines))
-    for line in reversed(segments):
-        parsed = _parse_progress_line(line)
-        if parsed:
-            return parsed
+    for raw_line in reversed(log_lines):
+        obj = _parse_json_log(raw_line)
+        if obj and obj.get("event") == "transfer_progress":
+            return {
+                "direction": obj.get("direction"),
+                "label": obj.get("label") or obj.get("direction") or "transfer",
+                "message_id": obj.get("message_id"),
+                "percent": int(obj.get("percent") or 0),
+                "size": obj.get("size") or "",
+                "speed_mb_s": obj.get("speed_mb_s"),
+                "line": _format_json_log(obj),
+            }
+        for line in reversed(list(_iter_log_segments([raw_line]))):
+            parsed = _parse_progress_line(line)
+            if parsed:
+                return parsed
     return None
 
 
 def _log_summary(log_lines):
+    warning = 0
+    error = 0
+    for line in log_lines:
+        obj = _parse_json_log(line)
+        level = str(obj.get("level") or "").lower() if obj else ""
+        if level == "warning" or "WARNING" in line:
+            warning += 1
+        if level == "error" or "ERROR" in line:
+            error += 1
     return {
         "total": len(log_lines),
-        "warning": sum(1 for line in log_lines if "WARNING" in line),
-        "error": sum(1 for line in log_lines if "ERROR" in line),
+        "warning": warning,
+        "error": error,
     }
 
 
@@ -85,42 +154,75 @@ def _extract_progress_history(log_lines, limit=200):
     history = []
     download_mb_s = 0.0
     upload_mb_s = 0.0
-    for line in _iter_log_segments(log_lines):
-        parsed = _parse_progress_line(line)
-        if not parsed:
-            continue
-        speed_mb_s = parsed.get("speed_mb_s")
-        if speed_mb_s is None:
+    for raw_line in log_lines:
+        obj = _parse_json_log(raw_line)
+        if obj and obj.get("event") == "transfer_progress":
+            speed_mb_s = obj.get("speed_mb_s")
+            direction = obj.get("direction")
+            if isinstance(speed_mb_s, (int, float)):
+                if direction == "download":
+                    download_mb_s = float(speed_mb_s)
+                elif direction == "upload":
+                    upload_mb_s = float(speed_mb_s)
+                history.append(
+                    {
+                        "download_mb_s": download_mb_s,
+                        "upload_mb_s": upload_mb_s,
+                    }
+                )
             continue
 
-        if parsed["direction"] == "download":
-            download_mb_s = speed_mb_s
-        else:
-            upload_mb_s = speed_mb_s
-        history.append(
-            {
-                "download_mb_s": download_mb_s,
-                "upload_mb_s": upload_mb_s,
-            }
-        )
+        for line in _iter_log_segments([raw_line]):
+            parsed = _parse_progress_line(line)
+            if not parsed:
+                continue
+            speed_mb_s = parsed.get("speed_mb_s")
+            if speed_mb_s is None:
+                continue
+
+            if parsed["direction"] == "download":
+                download_mb_s = speed_mb_s
+            else:
+                upload_mb_s = speed_mb_s
+            history.append(
+                {
+                    "download_mb_s": download_mb_s,
+                    "upload_mb_s": upload_mb_s,
+                }
+            )
     return history[-limit:]
 
 
 def _extract_recent_events(log_lines, max_rows=80):
     rows = []
     for line in log_lines:
+        obj = _parse_json_log(line)
+        if obj:
+            level = str(obj.get("level") or "").upper()
+            event = obj.get("event") or obj.get("logger") or "log"
+            rows.append(
+                {
+                    "level": level,
+                    "event": event,
+                    "message": _format_json_log(obj),
+                }
+            )
+            continue
+
         level = None
-        if " ERROR " in line:
+        upper_line = line.upper()
+        if " ERROR " in upper_line:
             level = "ERROR"
-        elif " WARNING " in line:
+        elif " WARNING " in upper_line:
             level = "WARNING"
-        elif " INFO " in line:
+        elif " INFO " in upper_line:
             level = "INFO"
         if not level:
             continue
         rows.append(
             {
                 "level": level,
+                "event": "plain",
                 "message": line.strip(),
             }
         )
@@ -241,11 +343,14 @@ if check_password(st):
         )
         run_script = os.path.join(project_root, "run_tgcf.py")
         run_mode = "past" if CONFIG.mode == 1 else "live"
-        with open("logs.txt", "w") as logs:
+        with open("logs.txt", "w", buffering=1, encoding="utf8", errors="replace") as logs:
+            child_env = os.environ.copy()
+            child_env["PYTHONUNBUFFERED"] = "1"
             popen_kwargs = {
                 "stdout": logs,
                 "stderr": subprocess.STDOUT,
                 "stdin": subprocess.DEVNULL,
+                "env": child_env,
             }
             if os.name == "nt":
                 popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -253,7 +358,7 @@ if check_password(st):
                 popen_kwargs["start_new_session"] = True
 
             process = subprocess.Popen(
-                [sys.executable, run_script, run_mode, "--loud"],
+                [sys.executable, "-u", run_script, run_mode, "--loud"],
                 **popen_kwargs,
             )
 
@@ -269,8 +374,7 @@ if check_password(st):
         st.rerun()
 
     try:
-        with open("logs.txt", "r", encoding="utf8", errors="replace") as file:
-            log_lines = file.readlines()
+        log_lines = _read_latest_log_lines("logs.txt")
 
         summary = _log_summary(log_lines)
         metric_1, metric_2, metric_3, metric_4 = st.columns(4)
@@ -311,6 +415,10 @@ if check_password(st):
             left, right = st.columns([2, 1])
             with left:
                 if progress_history:
+                    latest_speed = progress_history[-1]
+                    speed_c1, speed_c2 = st.columns(2)
+                    speed_c1.metric("Download speed", f"{latest_speed['download_mb_s']:.2f} MB/s")
+                    speed_c2.metric("Upload speed", f"{latest_speed['upload_mb_s']:.2f} MB/s")
                     st.write("Transfer speed trend (MB/s)")
                     st.line_chart(
                         {
@@ -320,7 +428,7 @@ if check_password(st):
                         use_container_width=True,
                     )
                 else:
-                    st.info("No transfer speed data yet.")
+                    st.info("No transfer speed data yet. Direct non-protected forwards are server-side and do not download/upload media.")
             with right:
                 if progress:
                     st.write("Latest transfer")
@@ -338,7 +446,11 @@ if check_password(st):
             ctl_left, ctl_mid, ctl_right, ctl_four = st.columns(4)
             with ctl_left:
                 lines = st.slider(
-                    "Lines of logs to show", min_value=100, max_value=5000, step=100, value=1000
+                    "Lines of logs to show",
+                    min_value=100,
+                    max_value=MAX_VISIBLE_LOG_LINES,
+                    step=100,
+                    value=MAX_VISIBLE_LOG_LINES,
                 )
             with ctl_mid:
                 keyword = st.text_input("Filter keyword", value="")
@@ -356,10 +468,10 @@ if check_password(st):
                 visible_lines = [
                     line
                     for line in visible_lines
-                    if "WARNING" in line or "ERROR" in line
+                    if "WARNING" in line.upper() or "ERROR" in line.upper()
                 ]
 
-            tail_text = "".join(visible_lines[-lines:])
+            tail_text = "".join(_display_log_line(line) for line in visible_lines[-lines:])
             st.text_area(
                 "Log output",
                 value=tail_text,

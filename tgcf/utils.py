@@ -18,8 +18,10 @@ from tqdm import tqdm
 from tgcf import __version__
 from tgcf.config import CONFIG
 from tgcf.fast_transfer import upload_file as fast_upload_file
+from tgcf.logging_utils import log_event
 from tgcf.plugin_models import FileType, STYLE_CODES
 
+LOGGER = logging.getLogger(__name__)
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 TEMP_DIR = os.path.join(BASE_DIR, "temp")
 FAST_SEND_FILE_PART_SIZE_KB = 1024
@@ -119,7 +121,20 @@ async def _send_file_fast_compatible(client: TelegramClient, *args, **kwargs):
 
                 elapsed = max(now - started_at, 1e-6)
                 speed_mbps = (uploaded_bytes / elapsed) / (1024 * 1024)
+                percent = round((uploaded_bytes / total) * 100, 2) if total else None
                 progress_bar.set_postfix_str(f"{speed_mbps:.2f} MB/s", refresh=False)
+                log_event(
+                    LOGGER,
+                    logging.INFO,
+                    "transfer_progress",
+                    direction="upload",
+                    label=f"upload {label}",
+                    recipient=recipient,
+                    current_bytes=uploaded_bytes,
+                    total_bytes=total,
+                    percent=percent,
+                    speed_mb_s=round(speed_mbps, 2),
+                )
                 last_draw_bytes = uploaded_bytes
                 last_draw_time = now
                 if progress_callback:

@@ -1,6 +1,7 @@
 import json
 import os
 import sqlite3
+from collections import deque
 from typing import Any, Dict, List
 
 import streamlit as st
@@ -73,6 +74,14 @@ def _connect_db() -> sqlite3.Connection:
         """
     )
     _ensure_log_columns(conn)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS index_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_logs_line_no ON logs(line_no)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs(timestamp)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level)")
@@ -82,6 +91,32 @@ def _connect_db() -> sqlite3.Connection:
     _enforce_row_cap(conn)
     conn.commit()
     return conn
+
+
+def _read_last_log_lines(log_file_path: str, limit: int = MAX_LOG_ROWS) -> List[tuple[int, str]]:
+    with open(log_file_path, "r", encoding="utf8", errors="replace") as f:
+        tail = deque(enumerate(f, start=1), maxlen=limit)
+    return list(tail)
+
+
+def _log_file_signature(log_file_path: str) -> str:
+    try:
+        stat = os.stat(log_file_path)
+    except FileNotFoundError:
+        return "missing"
+    return f"{stat.st_size}:{stat.st_mtime_ns}"
+
+
+def _get_meta(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM index_meta WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def _set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO index_meta(key, value) VALUES(?, ?)",
+        (key, value),
+    )
 
 
 def _parse_line(line: str, line_no: int) -> Dict[str, Any]:
@@ -152,13 +187,10 @@ def _rebuild_index(log_file_path: str) -> Dict[str, int]:
     conn = _connect_db()
     try:
         conn.execute("DELETE FROM logs")
-        with open(log_file_path, "r", encoding="utf8", errors="replace") as f:
-            rows = []
-            for line_no, line in enumerate(f, start=1):
-                rows.append(_parse_line(line, line_no))
-
-        if len(rows) > MAX_LOG_ROWS:
-            rows = rows[-MAX_LOG_ROWS:]
+        rows = [
+            _parse_line(line, line_no)
+            for line_no, line in _read_last_log_lines(log_file_path, MAX_LOG_ROWS)
+        ]
 
         conn.executemany(
             """
@@ -174,10 +206,30 @@ def _rebuild_index(log_file_path: str) -> Dict[str, int]:
             rows,
         )
         _enforce_row_cap(conn)
+        _set_meta(conn, "log_file_signature", _log_file_signature(log_file_path))
         conn.commit()
         return {"indexed": len(rows)}
     finally:
         conn.close()
+
+
+def _sync_index_if_needed(log_file_path: str) -> Dict[str, int]:
+    if not os.path.exists(log_file_path):
+        return {"indexed": 0, "changed": 0}
+
+    conn = _connect_db()
+    try:
+        signature = _log_file_signature(log_file_path)
+        existing_signature = _get_meta(conn, "log_file_signature")
+    finally:
+        conn.close()
+
+    if existing_signature == signature:
+        return {"indexed": _summary_counts()["total"], "changed": 0}
+
+    stats = _rebuild_index(log_file_path)
+    stats["changed"] = 1
+    return stats
 
 
 def _query_logs(
@@ -306,11 +358,13 @@ if check_password(st):
         if indexed_rows is not None:
             st.info(f"Indexed rows: {indexed_rows}")
         else:
-            st.caption("Click Rebuild Log Index after new log writes.")
+            st.caption(f"Auto-syncs from current log file and keeps latest {MAX_LOG_ROWS} rows.")
 
     if not os.path.exists(LOG_FILE_PATH):
         st.warning(f"Log file not found: {LOG_FILE_PATH}")
     else:
+        sync_stats = _sync_index_if_needed(LOG_FILE_PATH)
+        st.session_state["logs_indexed_rows"] = sync_stats.get("indexed", 0)
         counts = _summary_counts()
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Rows", counts["total"])
