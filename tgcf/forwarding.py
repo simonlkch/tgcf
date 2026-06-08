@@ -50,6 +50,49 @@ def _message_preview(message: Message) -> str:
     return _preview_text(getattr(message, "message", "") or "")
 
 
+def _active_session_label() -> str:
+    """Return a human-readable label for the active source session."""
+
+    from tgcf.config import CONFIG
+
+    login = CONFIG.login
+    if login.user_type == 1:
+        if login.sessions and 0 <= login.active_session < len(login.sessions):
+            name = (login.sessions[login.active_session].name or "").strip()
+            if name:
+                return f"{name} (active source session)"
+        if login.SESSION_STRING:
+            return "legacy source session"
+    if login.user_type == 0:
+        return "bot session"
+    return "source client session"
+
+
+async def _peer_label(client: TelegramClient, peer_id: Optional[int]) -> str:
+    """Return a readable peer label like 'Channel title (-100...)'."""
+
+    if peer_id is None:
+        return "unknown"
+    try:
+        entity = await client.get_entity(peer_id)
+    except Exception:
+        return str(peer_id)
+    title = (
+        getattr(entity, "title", None)
+        or getattr(entity, "username", None)
+        or " ".join(
+            part
+            for part in (
+                getattr(entity, "first_name", None),
+                getattr(entity, "last_name", None),
+            )
+            if part
+        )
+        or str(peer_id)
+    )
+    return f"{_preview_text(str(title), 80)} ({peer_id})"
+
+
 @dataclass(frozen=True)
 class ForwardBatch:
     """A normalized forwarding unit.
@@ -512,15 +555,25 @@ async def send_batch(
         )
         download_client = await _get_upload_client(route_download_session_name, client)
         upload_client = await _get_upload_client(route_upload_session_name, client)
-        effective_download_session = route_download_session_name or "(source client session)"
-        effective_upload_session = route_upload_session_name or "(source client session)"
+        source_session_label = _active_session_label()
+        effective_download_session = route_download_session_name or source_session_label
+        effective_upload_session = route_upload_session_name or source_session_label
+        source_label = await _peer_label(client, source_chat_id)
+        recipient_label = await _peer_label(upload_client, recipient)
 
-        logging.warning(
-            "transfer sessions source=%s recipient=%s download_session=%s upload_session=%s",
-            source_chat_id,
-            recipient,
-            effective_download_session,
-            effective_upload_session,
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "transfer_sessions_resolved",
+            source_chat_id=source_chat_id,
+            source=source_label,
+            recipient=recipient,
+            recipient_chat_id=recipient,
+            recipient_name=recipient_label,
+            download_session=effective_download_session,
+            upload_session=effective_upload_session,
+            download_session_routed=bool(route_download_session_name),
+            upload_session_routed=bool(route_upload_session_name),
         )
 
         def _ensure_msg_prefix(file_path: Optional[str], message_id: int) -> Optional[str]:
@@ -552,12 +605,17 @@ async def send_batch(
             if download_client is client:
                 file_path = await tm.get_file()
             else:
-                logging.warning(
-                    "downloading media using routed session source=%s recipient=%s message_id=%s download_session=%s",
-                    source_chat_id,
-                    recipient,
-                    message_id,
-                    effective_download_session,
+                log_event(
+                    LOGGER,
+                    logging.INFO,
+                    "routed_download_started",
+                    source_chat_id=source_chat_id,
+                    source=source_label,
+                    recipient=recipient,
+                    recipient_chat_id=recipient,
+                    recipient_name=recipient_label,
+                    message_id=message_id,
+                    download_session=effective_download_session,
                 )
                 source_message = await download_client.get_messages(source_chat_id, ids=message_id)
                 if not source_message:
@@ -630,12 +688,18 @@ async def send_batch(
                             if resume_from >= expected_size:
                                 resume_from = 0
                             if resume_from > 0:
-                                logging.warning(
-                                    "resuming routed media download source=%s recipient=%s message_id=%s offset=%s",
-                                    source_chat_id,
-                                    recipient,
-                                    message_id,
-                                    resume_from,
+                                log_event(
+                                    LOGGER,
+                                    logging.INFO,
+                                    "routed_download_resumed",
+                                    source_chat_id=source_chat_id,
+                                    source=source_label,
+                                    recipient=recipient,
+                                    recipient_chat_id=recipient,
+                                    recipient_name=recipient_label,
+                                    message_id=message_id,
+                                    download_session=effective_download_session,
+                                    offset=resume_from,
                                 )
                             mode = "ab" if resume_from > 0 else "wb"
                             with open(part_path, mode) as fp:
@@ -699,12 +763,19 @@ async def send_batch(
                 return
 
         if route_upload_session_name or route_download_session_name:
-            logging.warning(
-                "connection session routing source=%s recipient=%s download_session=%s upload_session=%s",
-                source_chat_id,
-                recipient,
-                effective_download_session,
-                effective_upload_session,
+            log_event(
+                LOGGER,
+                logging.INFO,
+                "connection_session_routing",
+                source_chat_id=source_chat_id,
+                source=source_label,
+                recipient=recipient,
+                recipient_chat_id=recipient,
+                recipient_name=recipient_label,
+                download_session=effective_download_session,
+                upload_session=effective_upload_session,
+                download_session_routed=bool(route_download_session_name),
+                upload_session_routed=bool(route_upload_session_name),
             )
 
         if (

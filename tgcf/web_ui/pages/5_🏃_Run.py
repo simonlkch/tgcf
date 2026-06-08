@@ -43,9 +43,14 @@ def _format_json_log(obj):
     message = obj.get("message") or obj.get("outcome") or ""
     fields = []
     for key in (
+        "source",
         "source_chat_id",
-        "destination_chat_id",
+        "recipient_name",
         "recipient",
+        "recipient_chat_id",
+        "destination_chat_id",
+        "download_session",
+        "upload_session",
         "message_id",
         "message_count",
         "sent_count",
