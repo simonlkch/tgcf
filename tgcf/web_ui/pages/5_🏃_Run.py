@@ -331,7 +331,15 @@ if check_password(st):
         stop = st.button("Stop", type="primary")
         if stop:
             try:
-                os.kill(CONFIG.pid, signal.SIGTERM)
+                if os.name == "nt":
+                    subprocess.run(
+                        ["taskkill", "/PID", str(CONFIG.pid), "/T", "/F"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                    )
+                else:
+                    os.kill(CONFIG.pid, signal.SIGTERM)
             except Exception as err:
                 st.code(err)
 
@@ -346,26 +354,35 @@ if check_password(st):
         project_root = os.path.abspath(
             os.path.join(os.path.dirname(__file__), "..", "..", "..")
         )
-        run_script = os.path.join(project_root, "run_tgcf.py")
+        runner_script = os.path.join(project_root, "tgcf", "log_tail_runner.py")
         run_mode = "past" if CONFIG.mode == 1 else "live"
-        with open("logs.txt", "w", buffering=1, encoding="utf8", errors="replace") as logs:
-            child_env = os.environ.copy()
-            child_env["PYTHONUNBUFFERED"] = "1"
-            popen_kwargs = {
-                "stdout": logs,
-                "stderr": subprocess.STDOUT,
-                "stdin": subprocess.DEVNULL,
-                "env": child_env,
-            }
-            if os.name == "nt":
-                popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-            else:
-                popen_kwargs["start_new_session"] = True
+        child_env = os.environ.copy()
+        child_env["PYTHONUNBUFFERED"] = "1"
+        popen_kwargs = {
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "stdin": subprocess.DEVNULL,
+            "env": child_env,
+            "cwd": project_root,
+        }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
 
-            process = subprocess.Popen(
-                [sys.executable, "-u", run_script, run_mode, "--loud"],
-                **popen_kwargs,
-            )
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-u",
+                runner_script,
+                run_mode,
+                "--log-file",
+                os.path.join(project_root, "logs.txt"),
+                "--max-lines",
+                str(MAX_VISIBLE_LOG_LINES),
+            ],
+            **popen_kwargs,
+        )
 
         if process.poll() is None:
             CONFIG.pid = process.pid
