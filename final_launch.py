@@ -2,7 +2,6 @@ import sys
 import os
 import subprocess
 import logging
-import threading
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s %(message)s')
@@ -42,27 +41,16 @@ def main():
                 'streamlit',
                 'run',
                 hello_file,
-                '--logger.level=debug',
+                '--logger.level=warning',
             ],
-            stdout=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
             env=env,
         )
 
-        def stream_output(pipe):
-            for raw in iter(pipe.readline, ''):
-                line = raw.rstrip('\n')
-                if line.strip() == '':
-                    logger.info('Streamlit输出: ')
-                    continue
-                logger.info(f'Streamlit输出: {line}')
-
-        t = threading.Thread(target=stream_output, args=(process.stdout,), daemon=True)
-        t.start()
         process.wait()
-        t.join(timeout=2)
 
         if process.returncode != 0:
             logger.error(f'Streamlit退出代码: {process.returncode}')

@@ -21,6 +21,24 @@ SPEED_RE = re.compile(r"([0-9.]+)\s*([KMG]?)B/s")
 MAX_VISIBLE_LOG_LINES = 1000
 
 
+def _is_pid_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _read_runner_lock_pid(lock_file: str) -> int:
+    try:
+        with open(lock_file, "r", encoding="utf-8") as file:
+            return int(file.read().strip() or "0")
+    except (FileNotFoundError, OSError, ValueError):
+        return 0
+
+
 def _read_latest_log_lines(path="logs.txt", limit=MAX_VISIBLE_LOG_LINES):
     with open(path, "r", encoding="utf8", errors="replace") as file:
         return list(deque(file, maxlen=limit))
@@ -356,6 +374,16 @@ if check_password(st):
         )
         runner_script = os.path.join(project_root, "tgcf", "log_tail_runner.py")
         run_mode = "past" if CONFIG.mode == 1 else "live"
+        log_file = os.path.join(project_root, "logs.txt")
+        lock_file = f"{log_file}.{run_mode}.lock"
+        existing_pid = _read_runner_lock_pid(lock_file)
+        if _is_pid_running(existing_pid):
+            CONFIG.pid = existing_pid
+            write_config(CONFIG)
+            st.warning(f"tgcf is already running as PID {existing_pid}; reusing existing process.")
+            time.sleep(1)
+            st.rerun()
+
         child_env = os.environ.copy()
         child_env["PYTHONUNBUFFERED"] = "1"
         popen_kwargs = {
@@ -377,7 +405,7 @@ if check_password(st):
                 runner_script,
                 run_mode,
                 "--log-file",
-                os.path.join(project_root, "logs.txt"),
+                log_file,
                 "--max-lines",
                 str(MAX_VISIBLE_LOG_LINES),
             ],
