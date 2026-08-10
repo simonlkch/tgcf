@@ -94,6 +94,13 @@ def _upload_file_name(file: UploadInput) -> str:
     return "upload.bin"
 
 
+# Timeout for a single chunk RPC call. Prevents silent hangs on dead TCP connections
+# that are common after long-running sessions (NAT/firewall dropping idle connections).
+_CHUNK_RPC_TIMEOUT_SECONDS = 60
+# Maximum time to wait for a parallel gather batch of chunks to complete.
+_PARALLEL_BATCH_TIMEOUT_SECONDS = 120
+
+
 class DownloadSender:
     client: TelegramClient
     sender: MTProtoSender
@@ -111,7 +118,7 @@ class DownloadSender:
         limit: int,
         stride: int,
         count: int,
-        retries: int = 3,
+        retries: int = 5,
     ) -> None:
         self.client = client
         self.sender = sender
@@ -124,13 +131,46 @@ class DownloadSender:
         if not self.remaining:
             return None
 
+        last_error: Optional[Exception] = None
         for attempt in range(1, self.retries + 1):
             try:
-                result = await self.client._call(self.sender, self.request)
+                result = await asyncio.wait_for(
+                    self.client._call(self.sender, self.request),
+                    timeout=_CHUNK_RPC_TIMEOUT_SECONDS,
+                )
                 self.remaining -= 1
                 self.request.offset += self.stride
                 return result.bytes or None
+            except (asyncio.TimeoutError, asyncio.CancelledError) as err:
+                last_error = err
+                log.warning(
+                    "Download chunk timed out attempt=%s/%s offset=%s limit=%s",
+                    attempt,
+                    self.retries,
+                    self.request.offset,
+                    self.request.limit,
+                )
+                # Try to reconnect the sender after timeout
+                with suppress(Exception):
+                    await self.sender.disconnect()
+                if attempt < self.retries:
+                    await asyncio.sleep(min(2 ** (attempt - 1), 10))
+                    # Reconnect this sender
+                    with suppress(Exception):
+                        dc = await self.client._get_dc(
+                            getattr(self.sender, "dc_id", None) or self.client.session.dc_id
+                        )
+                        await self.sender.connect(
+                            self.client._connection(
+                                dc.ip_address,
+                                dc.port,
+                                dc.id,
+                                loggers=self.client._log,
+                                proxy=self.client._proxy,
+                            )
+                        )
             except Exception as err:
+                last_error = err
                 if attempt >= self.retries:
                     raise
                 log.warning(
@@ -141,8 +181,10 @@ class DownloadSender:
                     self.request.limit,
                     err,
                 )
-                await asyncio.sleep(2 ** (attempt - 1))
+                await asyncio.sleep(min(2 ** (attempt - 1), 10))
 
+        if last_error:
+            raise last_error
         return None
 
     def disconnect(self):
@@ -190,12 +232,42 @@ class UploadSender:
 
     async def _next(self, data: bytes) -> None:
         self.request.bytes = data
+        last_error: Optional[Exception] = None
         for attempt in range(1, self.retries + 1):
             try:
-                await self.client._call(self.sender, self.request)
+                await asyncio.wait_for(
+                    self.client._call(self.sender, self.request),
+                    timeout=_CHUNK_RPC_TIMEOUT_SECONDS,
+                )
                 self.request.file_part += self.stride
                 return
+            except (asyncio.TimeoutError, asyncio.CancelledError) as err:
+                last_error = err
+                log.warning(
+                    "Upload chunk timed out attempt=%s/%s file_part=%s",
+                    attempt,
+                    self.retries,
+                    self.request.file_part,
+                )
+                with suppress(Exception):
+                    await self.sender.disconnect()
+                if attempt < self.retries:
+                    await asyncio.sleep(min(2 ** (attempt - 1), 10))
+                    with suppress(Exception):
+                        dc = await self.client._get_dc(
+                            getattr(self.sender, "dc_id", None) or self.client.session.dc_id
+                        )
+                        await self.sender.connect(
+                            self.client._connection(
+                                dc.ip_address,
+                                dc.port,
+                                dc.id,
+                                loggers=self.client._log,
+                                proxy=self.client._proxy,
+                            )
+                        )
             except Exception as err:
+                last_error = err
                 if attempt >= self.retries:
                     raise
                 log.warning(
@@ -205,7 +277,9 @@ class UploadSender:
                     self.request.file_part,
                     err,
                 )
-                await asyncio.sleep(2 ** (attempt - 1))
+                await asyncio.sleep(min(2 ** (attempt - 1), 10))
+        if last_error:
+            raise last_error
 
     async def disconnect(self) -> None:
         if self.previous:
@@ -245,7 +319,7 @@ class ParallelTransferrer:
     @staticmethod
     def _get_connection_count(
         file_size: int,
-        max_count: int = 20,
+        max_count: int = 8,
         full_size: int = 100 * 1024 * 1024,
     ) -> int:
         if file_size > full_size:
@@ -453,12 +527,32 @@ class ParallelTransferrer:
             while part < part_count:
                 tasks = [self.loop.create_task(sender.next()) for sender in self.senders or []]
                 try:
-                    results = await asyncio.gather(*tasks)
+                    results = await asyncio.wait_for(
+                        asyncio.gather(*tasks),
+                        timeout=_PARALLEL_BATCH_TIMEOUT_SECONDS,
+                    )
                     for data in results:
                         if not data:
                             return
                         yield data
                         part += 1
+                except (asyncio.TimeoutError, asyncio.CancelledError) as err:
+                    log.error(
+                        "Parallel download batch timed out after %ss at part=%s/%s, aborting transfer",
+                        _PARALLEL_BATCH_TIMEOUT_SECONDS,
+                        part,
+                        part_count,
+                    )
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    if tasks:
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                    # Clean up dead senders and raise so caller can retry
+                    await self._cleanup()
+                    raise ConnectionError(
+                        f"Parallel download stalled at part {part}/{part_count} (possible dead connection)"
+                    ) from err
                 finally:
                     for task in tasks:
                         if not task.done():

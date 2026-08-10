@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import sys
+from contextlib import suppress
 from typing import Dict, List, Tuple, Union
 
 from telethon import TelegramClient, events, functions, types
@@ -163,6 +164,28 @@ ALL_EVENTS = {
 }
 
 
+async def _main_client_keepalive(client: TelegramClient) -> None:
+    """Periodically ping the main client to prevent idle connection drops.
+
+    Long-running sessions (2-3+ hours) are vulnerable to NAT/firewall idle timeouts
+    that silently drop TCP connections, causing all RPC calls (including media
+    downloads) to hang indefinitely.
+    """
+    while True:
+        await asyncio.sleep(120)  # ping every 2 minutes
+        try:
+            if not client.is_connected():
+                logging.warning("main client appears disconnected, keepalive stopping")
+                return
+            await asyncio.wait_for(client.get_me(), timeout=20)
+        except asyncio.CancelledError:
+            return
+        except (asyncio.TimeoutError, ConnectionError, OSError) as err:
+            logging.warning("main client keepalive ping failed: %s (Telethon auto-reconnect will handle it)", err)
+        except Exception:
+            return
+
+
 async def start_sync() -> None:
     """Start tgcf live sync."""
     # clear past session files
@@ -216,4 +239,13 @@ async def start_sync() -> None:
             )
         )
     config.from_to = await config.load_from_to(client, config.CONFIG.forwards)
-    await client.run_until_disconnected()
+
+    # Start keepalive pings for the main client to prevent connection stalls.
+    keepalive_task = asyncio.create_task(_main_client_keepalive(client))
+
+    try:
+        await client.run_until_disconnected()
+    finally:
+        keepalive_task.cancel()
+        with suppress(Exception):
+            await keepalive_task

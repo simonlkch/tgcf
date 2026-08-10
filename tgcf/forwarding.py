@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import suppress
 from dataclasses import dataclass
 import json
 import logging
@@ -28,6 +30,64 @@ FAST_SEND_FILE_PART_SIZE_KB = 1024
 FORWARD_RESTRICTED_PAIRS = set()
 LOGGER = logging.getLogger(__name__)
 UPLOAD_SESSION_CLIENTS: dict[str, TelegramClient] = {}
+# Track last-use time for cached session clients so we can recycle stale ones.
+# Long-running processes (2-3+ hours) can have their connections silently dropped
+# by NAT/firewalls, causing RPC calls to hang forever.
+_UPLOAD_SESSION_LAST_USED: dict[str, float] = {}
+_UPLOAD_SESSION_MAX_IDLE_SECONDS = 30 * 60  # 30 minutes
+_CLIENT_PING_LOCK: dict[str, asyncio.Lock] = {}
+_CLIENT_PING_TASK: dict[str, asyncio.Task] = {}
+
+
+async def _ping_client_keepalive(client: TelegramClient, label: str) -> None:
+    """Periodically ping a client to keep the connection alive through NAT/firewalls."""
+    try:
+        while client.is_connected():
+            await asyncio.sleep(60)  # ping every 60 seconds
+            try:
+                await asyncio.wait_for(client.get_me(), timeout=15)
+            except (asyncio.TimeoutError, ConnectionError, OSError) as ping_err:
+                logging.warning(
+                    "keepalive ping failed for session=%s error=%s; will reconnect on next use",
+                    label,
+                    ping_err,
+                )
+                with suppress(Exception):
+                    await client.disconnect()
+                return
+            except Exception:
+                # Ping failures on a healthy connection are non-fatal
+                return
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        return
+
+
+async def _ensure_client_alive(client: TelegramClient, label: str) -> TelegramClient:
+    """Verify a cached client is alive; reconnect if needed. Start keepalive pings."""
+    try:
+        if not client.is_connected():
+            await client.connect()
+        # Send a lightweight ping to verify liveness
+        await asyncio.wait_for(client.get_me(), timeout=20)
+    except Exception as err:
+        logging.warning("cached session client '%s' is dead, reconnecting: %s", label, err)
+        with suppress(Exception):
+            await client.disconnect()
+        await client.connect()
+        if not await client.is_user_authorized():
+            raise
+
+    # Start a keepalive ping task if not already running
+    key = label.casefold()
+    existing_task = _CLIENT_PING_TASK.get(key)
+    if not existing_task or existing_task.done():
+        _CLIENT_PING_LOCK[key] = asyncio.Lock()
+        _CLIENT_PING_TASK[key] = asyncio.create_task(_ping_client_keepalive(client, label))
+
+    _UPLOAD_SESSION_LAST_USED[key] = time.time()
+    return client
 
 
 def _preview_text(text: Optional[str], limit: int = 120) -> str:
@@ -274,13 +334,34 @@ async def _get_upload_client(upload_session_name: str, source_client: TelegramCl
         return source_client
 
     key = name.casefold()
+
+    # Evict clients that have been idle too long — their connections are likely dead
+    # after long idle periods which causes freezes.
+    last_used = _UPLOAD_SESSION_LAST_USED.get(key, 0)
+    if last_used and (time.time() - last_used) > _UPLOAD_SESSION_MAX_IDLE_SECONDS:
+        stale = UPLOAD_SESSION_CLIENTS.pop(key, None)
+        _UPLOAD_SESSION_LAST_USED.pop(key, None)
+        ping_task = _CLIENT_PING_TASK.pop(key, None)
+        if ping_task and not ping_task.done():
+            ping_task.cancel()
+        if stale:
+            with suppress(Exception):
+                await stale.disconnect()
+            logging.info("evicted stale cached session client '%s' (idle > %ss)", name, _UPLOAD_SESSION_MAX_IDLE_SECONDS)
+
     cached = UPLOAD_SESSION_CLIENTS.get(key)
     if cached:
-        if not cached.is_connected():
-            await cached.connect()
-        if await cached.is_user_authorized():
+        try:
+            cached = await _ensure_client_alive(cached, name)
+            UPLOAD_SESSION_CLIENTS[key] = cached
             return cached
-        UPLOAD_SESSION_CLIENTS.pop(key, None)
+        except Exception as err:
+            logging.warning("cached session '%s' unrecoverable: %s; creating new client", name, err)
+            UPLOAD_SESSION_CLIENTS.pop(key, None)
+            _UPLOAD_SESSION_LAST_USED.pop(key, None)
+            ping_task = _CLIENT_PING_TASK.pop(key, None)
+            if ping_task and not ping_task.done():
+                ping_task.cancel()
 
     session = get_session_for_name(name, default=f"tgcf_upload_{key}")
     client = TelegramClient(session, CONFIG.login.API_ID, CONFIG.login.API_HASH)
@@ -288,6 +369,7 @@ async def _get_upload_client(upload_session_name: str, source_client: TelegramCl
     if not await client.is_user_authorized():
         await client.disconnect()
         raise ValueError(f"Upload session '{name}' is not authorized")
+    client = await _ensure_client_alive(client, name)
     UPLOAD_SESSION_CLIENTS[key] = client
     return client
 
@@ -597,6 +679,7 @@ async def send_batch(
                 return file_path
 
         async def _get_downloaded_file(tm):
+            nonlocal download_client
             message_id = int(getattr(tm.message, "id", 0) or 0)
             cached = downloaded_media_cache.get(message_id)
             if cached and os.path.exists(cached):
@@ -684,48 +767,124 @@ async def send_batch(
                         if os.path.exists(target_path) and os.path.getsize(target_path) == expected_size:
                             file_path = target_path
                         else:
-                            resume_from = os.path.getsize(part_path) if os.path.exists(part_path) else 0
-                            if resume_from >= expected_size:
-                                resume_from = 0
-                            if resume_from > 0:
-                                log_event(
-                                    LOGGER,
-                                    logging.INFO,
-                                    "routed_download_resumed",
-                                    source_chat_id=source_chat_id,
-                                    source=source_label,
-                                    recipient=recipient,
-                                    recipient_chat_id=recipient,
-                                    recipient_name=recipient_label,
-                                    message_id=message_id,
-                                    download_session=effective_download_session,
-                                    offset=resume_from,
-                                )
-                            mode = "ab" if resume_from > 0 else "wb"
-                            with open(part_path, mode) as fp:
-                                await download_file(
-                                    download_client,
-                                    document,
-                                    fp,
-                                    progress_callback=_routed_download_progress,
-                                    file_size=expected_size,
-                                    part_size_kb=FAST_SEND_FILE_PART_SIZE_KB,
-                                    offset=resume_from,
-                                )
-                            final_size = os.path.getsize(part_path)
+                            # Retry loop for transient stalls / connection resets.
+                            # Without retries, a single dead TCP connection would freeze the
+                            # entire forwarder indefinitely (typical after 2-3h uptime due to
+                            # NAT / firewall idle-timeouts).
+                            max_download_attempts = 5
+                            last_dl_err: Optional[Exception] = None
+                            for dl_attempt in range(1, max_download_attempts + 1):
+                                resume_from = os.path.getsize(part_path) if os.path.exists(part_path) else 0
+                                if resume_from >= expected_size:
+                                    resume_from = 0
+                                if resume_from > 0 and dl_attempt == 1:
+                                    log_event(
+                                        LOGGER,
+                                        logging.INFO,
+                                        "routed_download_resumed",
+                                        source_chat_id=source_chat_id,
+                                        source=source_label,
+                                        recipient=recipient,
+                                        recipient_chat_id=recipient,
+                                        recipient_name=recipient_label,
+                                        message_id=message_id,
+                                        download_session=effective_download_session,
+                                        offset=resume_from,
+                                    )
+                                elif dl_attempt > 1:
+                                    log_event(
+                                        LOGGER,
+                                        logging.WARNING,
+                                        "routed_download_retry",
+                                        source_chat_id=source_chat_id,
+                                        recipient_chat_id=recipient,
+                                        message_id=message_id,
+                                        attempt=dl_attempt,
+                                        max_attempts=max_download_attempts,
+                                        offset=resume_from,
+                                        error=str(last_dl_err) if last_dl_err else None,
+                                    )
+                                    # After a stall, evict the cached download client so it
+                                    # reconnects fresh instead of reusing a dead sender pool.
+                                    if download_client is not client:
+                                        dl_key = effective_download_session.casefold()
+                                        dead = UPLOAD_SESSION_CLIENTS.pop(dl_key, None)
+                                        _UPLOAD_SESSION_LAST_USED.pop(dl_key, None)
+                                        ping_task = _CLIENT_PING_TASK.pop(dl_key, None)
+                                        if ping_task and not ping_task.done():
+                                            ping_task.cancel()
+                                        if dead:
+                                            with suppress(Exception):
+                                                await dead.disconnect()
+                                        from tgcf.config import get_session_for_name
+                                        dl_session_name = route_download_session_name
+                                        session = get_session_for_name(dl_session_name, default=f"tgcf_upload_{dl_key}")
+                                        download_client = TelegramClient(
+                                            session, CONFIG.login.API_ID, CONFIG.login.API_HASH
+                                        )
+                                        await download_client.connect()
+                                        if not await download_client.is_user_authorized():
+                                            await download_client.disconnect()
+                                            raise ValueError(
+                                                f"Download session '{dl_session_name}' is not authorized"
+                                            )
+                                        download_client = await _ensure_client_alive(
+                                            download_client, dl_session_name
+                                        )
+                                        UPLOAD_SESSION_CLIENTS[dl_key] = download_client
+                                mode = "ab" if resume_from > 0 else "wb"
+                                try:
+                                    # Cap time per attempt to avoid indefinite hang even if the
+                                    # underlying chunk-level timeouts misfire.
+                                    # Rough estimate: 1MB/s minimum expected speed, plus headroom.
+                                    per_attempt_timeout = max(
+                                        300, int(expected_size / (1024 * 1024)) * 2 + 300
+                                    )
+                                    with open(part_path, mode) as fp:
+                                        await asyncio.wait_for(
+                                            download_file(
+                                                download_client,
+                                                document,
+                                                fp,
+                                                progress_callback=_routed_download_progress,
+                                                file_size=expected_size,
+                                                part_size_kb=CONFIG.live.transfer_part_size_kb,
+                                                connection_count=CONFIG.live.transfer_connection_count,
+                                                offset=resume_from,
+                                            ),
+                                            timeout=per_attempt_timeout,
+                                        )
+                                    final_size = os.path.getsize(part_path)
+                                    if final_size != expected_size:
+                                        raise IOError(
+                                            f"Partial routed download size mismatch: {final_size} != {expected_size}"
+                                        )
+                                    break
+                                except (asyncio.TimeoutError, ConnectionError, OSError) as dl_err:
+                                    last_dl_err = dl_err
+                                    logging.warning(
+                                        "download attempt %s/%s failed for msg %s: %s",
+                                        dl_attempt,
+                                        max_download_attempts,
+                                        message_id,
+                                        dl_err,
+                                    )
+                                    if dl_attempt >= max_download_attempts:
+                                        raise
+                                    await asyncio.sleep(min(2 ** (dl_attempt - 1), 15))
+                                    continue
+                            else:
+                                if last_dl_err:
+                                    raise last_dl_err
                             with open(meta_path, "w", encoding="utf-8") as meta_fp:
                                 json.dump(
                                     {
-                                        "offset": final_size,
+                                        "offset": os.path.getsize(part_path),
                                         "expected_size": expected_size,
                                         "updated_at": int(time.time()),
                                         "file_name": file_name,
                                     },
                                     meta_fp,
-                                )
-                            if final_size != expected_size:
-                                raise IOError(
-                                    f"Partial routed download size mismatch: {final_size} != {expected_size}"
                                 )
                             os.replace(part_path, target_path)
                             try:
