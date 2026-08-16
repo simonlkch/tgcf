@@ -1134,7 +1134,11 @@ async def send_batch(
                 caption=captions,
                 reply_to=reply_to,
                 part_size_kb=CONFIG.live.transfer_part_size_kb,
-                source_media_type=transformed[0].file_type,
+                # Pass per-file media types so the album path can set
+                # supports_streaming=True whenever any item is a video.
+                # Using only the first file's type caused videos inside
+                # mixed albums to arrive as non-streaming documents.
+                source_media_type=[tm.file_type for tm in transformed],
             )
             if isinstance(uploaded, list):
                 return uploaded

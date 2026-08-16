@@ -18,6 +18,12 @@ from typing import Any, Dict
 from hachoir.metadata import extractMetadata
 from hachoir.parser import createParser
 from telethon.tl.custom.message import Message
+from telethon.tl.types import (
+    Document,
+    DocumentAttributeAnimated,
+    DocumentAttributeSticker,
+    DocumentAttributeVideo,
+)
 from tqdm import tqdm
 from tgcf.config import CONFIG
 from tgcf.fast_transfer import download_file
@@ -576,13 +582,65 @@ class TgcfMessage:
         self.cleanup = True
         return self.new_file
 
+    @staticmethod
+    def _classify_document(document: "Document") -> FileType:
+        """Refine a generic Document into VIDEO / VIDEO_NOTE / GIF / STICKER.
+
+        Telegram messages from a protected channel never expose typed media
+        shortcuts (message.video, message.gif, ...) — Telethon only sees a
+        generic Document. Without this re-classification the downstream
+        send_file path would treat an album video as DOCUMENT and the upload
+        would land in Telegram without ``supports_streaming=True``, so the
+        recipient has to download the video before it can play.
+        """
+
+        if document is None:
+            return FileType.DOCUMENT
+
+        attributes = list(getattr(document, "attributes", None) or [])
+        is_animated = any(isinstance(attr, DocumentAttributeAnimated) for attr in attributes)
+        for attr in attributes:
+            if not isinstance(attr, DocumentAttributeVideo):
+                continue
+            # round_message == True marks a circular video note.
+            if getattr(attr, "round_message", False):
+                return FileType.VIDEO_NOTE
+            if is_animated:
+                return FileType.GIF
+            return FileType.VIDEO
+
+        if is_animated:
+            return FileType.GIF
+
+        if any(isinstance(attr, DocumentAttributeSticker) for attr in attributes):
+            return FileType.STICKER
+
+        return FileType.DOCUMENT
+
     def guess_file_type(self) -> FileType:
+        # Iterate every concrete media kind EXCEPT DOCUMENT first. For
+        # protected-channel messages, Telethon only sets ``message.document``
+        # and never populates the typed shortcuts (message.video, message.gif,
+        # ...). Falling through to the document classifier below is what lets
+        # an album video get the right kind and ultimately be uploaded with
+        # ``supports_streaming=True``.
         for i in FileType:
-            if i == FileType.NOFILE:
-                return i
+            if i in (FileType.DOCUMENT, FileType.NOFILE):
+                continue
             obj = getattr(self.message, i.value)
             if obj:
                 return i
+
+        # Fallback: if the message only exposes a generic ``document`` media
+        # (typical for albums from a protected channel where Telethon cannot
+        # populate the typed shortcuts), inspect the document's attributes to
+        # recover the real media kind. This is critical for album uploads:
+        # otherwise the downstream path uploads the video as a non-streaming
+        # document that must be downloaded before playback.
+        document = getattr(self.message, "document", None)
+        if document is not None:
+            return self._classify_document(document)
+        return FileType.NOFILE
 
     def clear(self) -> None:
         if self.new_file and self.cleanup:

@@ -277,6 +277,437 @@ class ForwardingHelpersTest(unittest.TestCase):
         self.assertEqual(captured.get("thumb"), "cached_thumb.jpg")
         self.assertEqual(tm.ensure_thumb_calls, 1)
 
+    def test_send_batch_album_passes_per_file_media_types_with_streaming(self):
+        """Album uploads must enable streaming whenever any item is a video,
+        otherwise Telegram stores the video as a non-streaming document and
+        clients have to download it before playback (the original bug)."""
+
+        from tgcf.config import CONFIG
+
+        original_forwarded = CONFIG.show_forwarded_from
+        original_fallback = CONFIG.live.forward_fallback_to_reupload
+        CONFIG.show_forwarded_from = False
+        CONFIG.live.forward_fallback_to_reupload = True
+
+        # Build a mixed album: photo first, then video. The original code only
+        # sent transformed[0].file_type (PHOTO) which left the video with
+        # supports_streaming=False.
+        photo_tm = DummyTgcfMessage(DummyClient())
+        photo_tm.file_type = FileType.PHOTO
+        photo_tm.new_file = "photo_1.jpg"
+
+        video_tm = DummyTgcfMessage(DummyClient())
+        video_tm.file_type = FileType.VIDEO
+        video_tm.new_file = "video_2.mp4"
+
+        captured = {}
+
+        async def fake_apply_plugins(message):
+            return {id(message): photo_tm, id(message) + 1: video_tm}.get(id(message))
+
+        async def fake_send_file_fast_compatible(_client, _recipient, _file, **kwargs):
+            captured["kwargs"] = kwargs
+            captured["file"] = _file
+            return [DummySentMessage(901), DummySentMessage(902)]
+
+        # send_batch iterates `messages` in order; give it two real objects
+        # that map 1:1 to our two DummyTgcfMessage instances.
+        photo_msg = object()
+        video_msg = object()
+        apply_lookup = {id(photo_msg): photo_tm, id(video_msg): video_tm}
+
+        async def apply_by_id(message):
+            return apply_lookup[id(message)]
+
+        try:
+            with patch("tgcf.plugins.apply_plugins", side_effect=apply_by_id), patch(
+                "tgcf.forwarding._send_file_fast_compatible",
+                side_effect=fake_send_file_fast_compatible,
+            ):
+                import asyncio
+
+                sent = asyncio.run(send_batch(12345, [photo_msg, video_msg]))
+        finally:
+            CONFIG.show_forwarded_from = original_forwarded
+            CONFIG.live.forward_fallback_to_reupload = original_fallback
+
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(
+            captured["file"], ["photo_1.jpg", "video_2.mp4"]
+        )
+        # The full per-file list must be passed (not just the first item's type).
+        self.assertEqual(
+            captured["kwargs"].get("source_media_type"),
+            [FileType.PHOTO, FileType.VIDEO],
+        )
+        # Album path should not have invoked tm.get_file() since new_file was set
+        self.assertFalse(photo_tm.cleared is False and photo_tm.new_file is None)  # sanity
+
+    def test_send_batch_album_all_photos_does_not_set_streaming(self):
+        """All-photo albums must NOT set supports_streaming — there's no
+        video to stream and the per-file list must still be threaded through."""
+
+        from tgcf.config import CONFIG
+
+        original_forwarded = CONFIG.show_forwarded_from
+        original_fallback = CONFIG.live.forward_fallback_to_reupload
+        CONFIG.show_forwarded_from = False
+        CONFIG.live.forward_fallback_to_reupload = True
+
+        photo_a = DummyTgcfMessage(DummyClient())
+        photo_a.file_type = FileType.PHOTO
+        photo_a.new_file = "a.jpg"
+
+        photo_b = DummyTgcfMessage(DummyClient())
+        photo_b.file_type = FileType.PHOTO
+        photo_b.new_file = "b.jpg"
+
+        captured = {}
+
+        async def fake_send_file_fast_compatible(_client, _recipient, _file, **kwargs):
+            captured["kwargs"] = kwargs
+            captured["file"] = _file
+            return [DummySentMessage(911), DummySentMessage(912)]
+
+        msg_a = object()
+        msg_b = object()
+        lookup = {id(msg_a): photo_a, id(msg_b): photo_b}
+
+        async def apply_by_id(message):
+            return lookup[id(message)]
+
+        try:
+            with patch("tgcf.plugins.apply_plugins", side_effect=apply_by_id), patch(
+                "tgcf.forwarding._send_file_fast_compatible",
+                side_effect=fake_send_file_fast_compatible,
+            ):
+                import asyncio
+
+                sent = asyncio.run(send_batch(12345, [msg_a, msg_b]))
+        finally:
+            CONFIG.show_forwarded_from = original_forwarded
+            CONFIG.live.forward_fallback_to_reupload = original_fallback
+
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(captured["file"], ["a.jpg", "b.jpg"])
+        self.assertEqual(
+            captured["kwargs"].get("source_media_type"),
+            [FileType.PHOTO, FileType.PHOTO],
+        )
+
+
+class SendFileFastCompatibleTest(unittest.TestCase):
+    """Direct unit tests for the album-list branch in _send_file_fast_compatible.
+
+    These verify the inner-folder behavior (not just that the caller passes the
+    right list): when a list of files is given together with a per-file
+    source_media_type list, the function must tag the upload with
+    supports_streaming=True iff any item is a video.
+    """
+
+    def _run(self, coro):
+        import asyncio
+
+        return asyncio.run(coro)
+
+    def test_album_with_video_enables_streaming(self):
+        from tgcf.utils import _send_file_fast_compatible
+
+        captured = {}
+
+        async def fake_send_file(self, entity, file, *args, **kwargs):
+            captured["entity"] = entity
+            captured["file"] = file
+            captured["kwargs"] = kwargs
+            return "ok"
+
+        client = DummyClient()
+        with patch.object(client.__class__, "send_file", new=fake_send_file):
+            self._run(
+                _send_file_fast_compatible(
+                    client,
+                    12345,
+                    ["a.jpg", "b.mp4"],
+                    caption=["cap1", "cap2"],
+                    source_media_type=[FileType.PHOTO, FileType.VIDEO],
+                )
+            )
+
+        self.assertEqual(captured["file"], ["a.jpg", "b.mp4"])
+        self.assertTrue(captured["kwargs"].get("supports_streaming"))
+        self.assertFalse(captured["kwargs"].get("force_document"))
+
+    def test_album_without_video_disables_streaming(self):
+        from tgcf.utils import _send_file_fast_compatible
+
+        captured = {}
+
+        async def fake_send_file(self, entity, file, *args, **kwargs):
+            captured["kwargs"] = kwargs
+
+        client = DummyClient()
+        with patch.object(client.__class__, "send_file", new=fake_send_file):
+            self._run(
+                _send_file_fast_compatible(
+                    client,
+                    12345,
+                    ["a.jpg", "b.jpg"],
+                    caption=["cap1", "cap2"],
+                    source_media_type=[FileType.PHOTO, FileType.PHOTO],
+                )
+            )
+
+        self.assertFalse(captured["kwargs"].get("supports_streaming"))
+        self.assertFalse(captured["kwargs"].get("force_document"))
+
+    def test_album_video_first_still_enables_streaming(self):
+        """Regression: a video-first album used to take the single-photo
+        early-return path because the first item was VIDEO and not PHOTO,
+        but the list branch in the old code then dropped all attributes.
+        With the fix, the per-file list still flags the video for streaming."""
+
+        from tgcf.utils import _send_file_fast_compatible
+
+        captured = {}
+
+        async def fake_send_file(self, entity, file, *args, **kwargs):
+            captured["kwargs"] = kwargs
+
+        client = DummyClient()
+        with patch.object(client.__class__, "send_file", new=fake_send_file):
+            self._run(
+                _send_file_fast_compatible(
+                    client,
+                    12345,
+                    ["a.mp4", "b.jpg"],
+                    caption=["cap1", "cap2"],
+                    source_media_type=[FileType.VIDEO, FileType.PHOTO],
+                )
+            )
+
+        self.assertTrue(captured["kwargs"].get("supports_streaming"))
+
+    def test_album_accepts_legacy_single_media_type(self):
+        """Backward compat: callers that still pass a single FileType for an
+        album get the same broadcast semantics — a list of all PHOTO yields
+        supports_streaming=False."""
+
+        from tgcf.utils import _send_file_fast_compatible
+
+        captured = {}
+
+        async def fake_send_file(self, entity, file, *args, **kwargs):
+            captured["kwargs"] = kwargs
+
+        client = DummyClient()
+        with patch.object(client.__class__, "send_file", new=fake_send_file):
+            self._run(
+                _send_file_fast_compatible(
+                    client,
+                    12345,
+                    ["a.jpg", "b.jpg"],
+                    caption=["cap1", "cap2"],
+                    source_media_type=FileType.PHOTO,
+                )
+            )
+
+        self.assertFalse(captured["kwargs"].get("supports_streaming"))
+
+
+class TgcfMessageFileTypeTest(unittest.TestCase):
+    """Cover the document-attribute fallback in TgcfMessage.guess_file_type.
+
+    For protected channels, Telethon only sees a generic ``Document`` media
+    on the message — it does not populate ``message.video`` / ``message.gif``
+    / etc. Without the attribute-based re-classification the album path would
+    treat an album video as DOCUMENT and upload it without
+    ``supports_streaming=True``, so the recipient has to download the video
+    before it plays.
+    """
+
+    def _make_message(self, document):
+        message = type(
+            "M",
+            (),
+            {
+                "text": "",
+                "raw_text": "",
+                "client": None,
+                "sender_id": 1,
+                "id": 1,
+                "document": document,
+                "video": None,
+                "photo": None,
+                "audio": None,
+                "gif": None,
+                "video_note": None,
+                "sticker": None,
+                "contact": None,
+            },
+        )()
+        return message
+
+    def test_classify_document_detects_video(self):
+        from tgcf.plugins import TgcfMessage
+        from telethon.tl.types import Document, DocumentAttributeVideo
+
+        document = Document(
+            id=1,
+            access_hash=0,
+            file_reference=b"",
+            date=0,
+            mime_type="video/mp4",
+            size=0,
+            dc_id=0,
+            attributes=[DocumentAttributeVideo(0, 0, 0, round_message=False)],
+        )
+        tm = TgcfMessage(self._make_message(document))
+        self.assertEqual(tm.file_type, FileType.VIDEO)
+
+    def test_classify_document_detects_video_note(self):
+        from tgcf.plugins import TgcfMessage
+        from telethon.tl.types import Document, DocumentAttributeVideo
+
+        document = Document(
+            id=1,
+            access_hash=0,
+            file_reference=b"",
+            date=0,
+            mime_type="video/mp4",
+            size=0,
+            dc_id=0,
+            attributes=[DocumentAttributeVideo(0, 0, 0, round_message=True)],
+        )
+        tm = TgcfMessage(self._make_message(document))
+        self.assertEqual(tm.file_type, FileType.VIDEO_NOTE)
+
+    def test_classify_document_detects_animated_video_as_gif(self):
+        from tgcf.plugins import TgcfMessage
+        from telethon.tl.types import (
+            Document,
+            DocumentAttributeAnimated,
+            DocumentAttributeVideo,
+        )
+
+        document = Document(
+            id=1,
+            access_hash=0,
+            file_reference=b"",
+            date=0,
+            mime_type="video/mp4",
+            size=0,
+            dc_id=0,
+            attributes=[
+                DocumentAttributeVideo(0, 0, 0, round_message=False),
+                DocumentAttributeAnimated(),
+            ],
+        )
+        tm = TgcfMessage(self._make_message(document))
+        self.assertEqual(tm.file_type, FileType.GIF)
+
+    def test_classify_document_detects_standalone_animated_as_gif(self):
+        from tgcf.plugins import TgcfMessage
+        from telethon.tl.types import Document, DocumentAttributeAnimated
+
+        document = Document(
+            id=1,
+            access_hash=0,
+            file_reference=b"",
+            date=0,
+            mime_type="application/x-tgsticker",
+            size=0,
+            dc_id=0,
+            attributes=[DocumentAttributeAnimated()],
+        )
+        tm = TgcfMessage(self._make_message(document))
+        self.assertEqual(tm.file_type, FileType.GIF)
+
+    def test_classify_document_keeps_generic_document(self):
+        from tgcf.plugins import TgcfMessage
+        from telethon.tl.types import Document
+
+        document = Document(
+            id=1,
+            access_hash=0,
+            file_reference=b"",
+            date=0,
+            mime_type="application/zip",
+            size=0,
+            dc_id=0,
+            attributes=[],
+        )
+        tm = TgcfMessage(self._make_message(document))
+        self.assertEqual(tm.file_type, FileType.DOCUMENT)
+
+    def test_album_video_classified_via_document_attributes_marks_streaming(self):
+        """End-to-end: an album video coming from a protected channel (only
+        ``message.document`` populated) must be classified as VIDEO so the
+        send_file path sets ``supports_streaming=True``.
+        """
+        from tgcf.config import CONFIG
+        from tgcf.plugins import TgcfMessage
+        from telethon.tl.types import Document, DocumentAttributeVideo
+
+        original_forwarded = CONFIG.show_forwarded_from
+        original_fallback = CONFIG.live.forward_fallback_to_reupload
+        CONFIG.show_forwarded_from = False
+        CONFIG.live.forward_fallback_to_reupload = True
+
+        try:
+            photo_tm = DummyTgcfMessage(DummyClient())
+            photo_tm.file_type = FileType.PHOTO
+            photo_tm.new_file = "photo.jpg"
+
+            video_document = Document(
+                id=2,
+                access_hash=0,
+                file_reference=b"",
+                date=0,
+                mime_type="video/mp4",
+                size=0,
+                dc_id=0,
+                attributes=[DocumentAttributeVideo(0, 0, 0, round_message=False)],
+            )
+            video_message = self._make_message(video_document)
+            video_tm = TgcfMessage(video_message)
+            # Sanity: protected-channel-style message has message.video=None
+            # and the classifier must still detect VIDEO via attributes.
+            self.assertIsNone(video_message.video)
+            self.assertEqual(video_tm.file_type, FileType.VIDEO)
+            video_tm.new_file = "video.mp4"
+
+            captured = {}
+
+            async def fake_send_file_fast_compatible(_client, _recipient, _file, **kwargs):
+                captured["kwargs"] = kwargs
+                captured["file"] = _file
+                return [DummySentMessage(801), DummySentMessage(802)]
+
+            photo_msg = object()
+            lookup = {id(photo_msg): photo_tm, id(video_message): video_tm}
+
+            async def apply_by_id(message):
+                return lookup[id(message)]
+
+            with patch("tgcf.plugins.apply_plugins", side_effect=apply_by_id), patch(
+                "tgcf.forwarding._send_file_fast_compatible",
+                side_effect=fake_send_file_fast_compatible,
+            ):
+                import asyncio
+
+                asyncio.run(send_batch(12345, [photo_msg, video_message]))
+        finally:
+            CONFIG.show_forwarded_from = original_forwarded
+            CONFIG.live.forward_fallback_to_reupload = original_fallback
+
+        self.assertEqual(
+            captured["file"], ["photo.jpg", "video.mp4"]
+        )
+        self.assertEqual(
+            captured["kwargs"].get("source_media_type"),
+            [FileType.PHOTO, FileType.VIDEO],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

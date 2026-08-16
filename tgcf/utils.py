@@ -40,10 +40,20 @@ async def _send_file_fast_compatible(client: TelegramClient, *args, **kwargs):
         progress_callback = kwargs.pop("progress_callback", None)
         source_media_type = kwargs.pop("source_media_type", None)
 
-        if source_media_type == FileType.PHOTO:
+        if source_media_type == FileType.PHOTO and not isinstance(file, (list, tuple)):
             return await client.send_file(recipient, file, *args[2:], **kwargs)
 
-        if isinstance(file, (str, os.PathLike)) and os.path.exists(file):
+        # Normalize source_media_type: a single FileType becomes a per-file list
+        # so mixed albums (e.g. photo + video) get correct per-file handling.
+        is_album = isinstance(file, (list, tuple))
+        if isinstance(source_media_type, (list, tuple)):
+            media_types = list(source_media_type)
+        elif is_album:
+            media_types = [source_media_type] * len(file)
+        else:
+            media_types = [source_media_type]
+
+        if not is_album and isinstance(file, (str, os.PathLike)) and os.path.exists(file):
             voice_note = source_media_type == FileType.AUDIO and False
             video_note = source_media_type == FileType.VIDEO_NOTE
             supports_streaming = source_media_type == FileType.VIDEO
@@ -62,6 +72,20 @@ async def _send_file_fast_compatible(client: TelegramClient, *args, **kwargs):
                 "voice_note": voice_note,
                 "video_note": video_note,
                 "supports_streaming": supports_streaming,
+            }
+        elif is_album:
+            # Telethon's _send_album applies a single `supports_streaming` and
+            # `force_document` value to every file, and does not accept per-file
+            # `attributes` or `mime_type`. So we can only flip the album-level
+            # `supports_streaming` flag: if any item is a video/animated file we
+            # must set it, otherwise Telegram marks the video as a document that
+            # must be downloaded before playback.
+            _STREAMING_TYPES = (FileType.VIDEO, FileType.VIDEO_NOTE, FileType.GIF)
+            has_streaming_item = any(mt in _STREAMING_TYPES for mt in media_types)
+            kwargs = {
+                **kwargs,
+                "supports_streaming": has_streaming_item,
+                "force_document": False,
             }
 
         def _is_payload_too_big_error(err: Exception) -> bool:
