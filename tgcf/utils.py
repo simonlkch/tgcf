@@ -7,9 +7,9 @@ import re
 import time
 import sys
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Iterable, List, Optional
 
-from telethon import utils as telethon_utils
+from telethon import functions, types, utils as telethon_utils
 from telethon.client import TelegramClient
 from telethon.hints import EntityLike
 from telethon.tl.custom.message import Message
@@ -39,6 +39,11 @@ async def _send_file_fast_compatible(client: TelegramClient, *args, **kwargs):
         connection_count = max(1, min(configured_connections, 20))
         progress_callback = kwargs.pop("progress_callback", None)
         source_media_type = kwargs.pop("source_media_type", None)
+        # Optional per-file thumb list for album uploads. When supplied, we
+        # route the album through our own ``_send_album_with_thumbs`` helper
+        # because Telethon's built-in ``_send_album`` discards ``thumb`` when
+        # building each ``InputMediaUploadedDocument``.
+        album_thumbs = kwargs.pop("album_thumbs", None)
 
         if source_media_type == FileType.PHOTO and not isinstance(file, (list, tuple)):
             return await client.send_file(recipient, file, *args[2:], **kwargs)
@@ -87,7 +92,19 @@ async def _send_file_fast_compatible(client: TelegramClient, *args, **kwargs):
                 "supports_streaming": has_streaming_item,
                 "force_document": False,
             }
-
+            # If the caller supplied at least one per-file thumb, we need to
+            # route this album through our ``_send_album_with_thumbs`` helper
+            # because Telethon's built-in ``_send_album`` drops ``thumb`` when
+            # building each ``InputMediaUploadedDocument``. We delay the actual
+            # call until the files have been uploaded so we can pass the
+            # already-uploaded ``InputFile`` handles (and the thumb paths) to
+            # the helper.
+            if album_thumbs and any(album_thumbs):
+                _route_album_through_helper = True
+            else:
+                _route_album_through_helper = False
+        else:
+            _route_album_through_helper = False
         def _is_payload_too_big_error(err: Exception) -> bool:
             text = str(err).lower()
             return "payload is too big" in text or "savebigfilepartrequest is too long" in text
@@ -215,6 +232,31 @@ async def _send_file_fast_compatible(client: TelegramClient, *args, **kwargs):
         else:
             file = await _prepare(file)
 
+        if is_album and _route_album_through_helper:
+            # Telethon's _send_album silently drops the per-file ``thumb``
+            # argument, so any video we forward inside an album would land
+            # on the destination without a thumbnail. Route through our own
+            # helper that threads the thumb into _file_to_media instead.
+            supports_streaming_for_helper = bool(kwargs.get("supports_streaming", False))
+            captions = kwargs.get("caption") or []
+            if not isinstance(captions, (list, tuple)):
+                captions = [captions] * len(file)
+            return await _send_album_with_thumbs(
+                client,
+                recipient,
+                file,
+                album_thumbs,
+                captions=captions,
+                reply_to=kwargs.get("reply_to"),
+                supports_streaming=supports_streaming_for_helper,
+                force_document=bool(kwargs.get("force_document", False)),
+                silent=kwargs.get("silent"),
+                schedule=kwargs.get("schedule"),
+                background=kwargs.get("background"),
+                clear_draft=kwargs.get("clear_draft"),
+                progress_callback=progress_callback,
+            )
+
         try:
             return await client.send_file(recipient, file, *args[2:], **kwargs)
         except TypeError as err:
@@ -230,6 +272,119 @@ async def _send_file_fast_compatible(client: TelegramClient, *args, **kwargs):
             raise
         kwargs.pop("part_size_kb", None)
         return await client.send_file(*args, **kwargs)
+
+
+async def _send_album_with_thumbs(
+    client: TelegramClient,
+    entity: EntityLike,
+    files: List[Any],
+    thumbs: List[Optional[str]],
+    *,
+    captions: Iterable[str] = (),
+    reply_to: Optional[int] = None,
+    supports_streaming: bool = False,
+    force_document: bool = False,
+    silent: Optional[bool] = None,
+    schedule: Optional[Any] = None,
+    background: Optional[bool] = None,
+    clear_draft: Optional[bool] = None,
+    progress_callback: Optional[Any] = None,
+) -> List[Any]:
+    """Album upload that supports per-file thumbnails.
+
+    Telethon's internal ``_send_album`` deliberately drops the ``thumb``
+    argument when it builds each ``InputMediaUploadedDocument``, so any video
+    inside an album ends up uploaded without a thumbnail and the recipient
+    sees a blank tile. This helper re-implements the album upload pipeline
+    but threads a per-file ``thumb`` path into ``_file_to_media`` so the
+    generated ``InputMediaUploadedDocument`` carries the thumbnail the
+    caller asked for.
+
+    The implementation mirrors ``TelegramClient._send_album`` so behavior
+    (Photo-vs-Document media resolution, UploadMedia re-encoding step,
+    SendMultiMedia request) is identical to what Telethon would do — only
+    the missing thumb support is added.
+    """
+
+    if not files:
+        return []
+
+    entity = await client.get_input_entity(entity)
+    captions_list = list(captions)
+    if len(captions_list) < len(files):
+        captions_list = captions_list + [""] * (len(files) - len(captions_list))
+
+    media_list: List[types.InputSingleMedia] = []
+    for index, file in enumerate(files):
+        thumb_path = thumbs[index] if index < len(thumbs) else None
+        # ``_file_to_media`` will:
+        #   * upload ``file`` (or reuse the ``InputFile`` handle we pass in)
+        #   * when ``thumb`` is set, upload it as a separate ``InputFile`` and
+        #     attach it to the resulting ``InputMediaUploadedDocument.thumb``
+        #   * respect ``supports_streaming`` so videos remain streamable
+        file_handle, fm, _ = await client._file_to_media(
+            file,
+            supports_streaming=supports_streaming,
+            force_document=force_document,
+            thumb=thumb_path,
+            progress_callback=None,
+            nosound_video=True,
+        )
+        if fm is None:
+            raise ValueError(f"Failed to convert album item #{index} to media")
+
+        if isinstance(fm, (types.InputMediaUploadedPhoto, types.InputMediaPhotoExternal)):
+            re_encoded = await client(functions.messages.UploadMediaRequest(entity, media=fm))
+            fm = telethon_utils.get_input_media(re_encoded.photo)
+        elif isinstance(fm, (types.InputMediaUploadedDocument, types.InputMediaDocumentExternal)):
+            re_encoded = await client(functions.messages.UploadMediaRequest(entity, media=fm))
+            fm = telethon_utils.get_input_media(
+                re_encoded.document, supports_streaming=supports_streaming
+            )
+
+        if not isinstance(fm, (types.InputMediaPhoto, types.InputMediaDocument)):
+            # Photo must be re-encoded into an InputMediaPhoto; documents stay
+            # as InputMediaDocument. Anything else cannot be placed inside an
+            # album (Telegram only accepts those two kinds).
+            raise TypeError(
+                f"Album item #{index} resolved to unsupported media type {type(fm).__name__}"
+            )
+
+        media_list.append(
+            types.InputSingleMedia(
+                media=fm,
+                message=captions_list[index] or "",
+                entities=None,
+                # random_id is autogenerated by Telethon
+            )
+        )
+        if progress_callback is not None:
+            try:
+                progress_callback(index + 1, len(files))
+            except Exception:
+                logging.exception("album progress callback raised; continuing")
+
+    reply_to_input = None
+    if reply_to is not None:
+        reply_to_input = types.InputReplyToMessage(reply_to)
+
+    # ``SendMultiMediaRequest`` takes ``peer`` (not ``entity``) per Telethon's
+    # TL schema. The earlier code used ``entity=...`` which raised
+    # ``TypeError: SendMultiMediaRequest.__init__() got an unexpected keyword
+    # argument 'entity'`` and the entire album upload failed.
+    request = functions.messages.SendMultiMediaRequest(
+        peer=entity,
+        reply_to=reply_to_input,
+        multi_media=media_list,
+        silent=silent,
+        schedule_date=schedule,
+        clear_draft=clear_draft,
+        background=background,
+    )
+    result = await client(request)
+    random_ids = [m.random_id for m in media_list]
+    return client._get_response_message(random_ids, result, entity)
+
 
 if TYPE_CHECKING:
     from tgcf.plugins import TgcfMessage

@@ -709,5 +709,178 @@ class TgcfMessageFileTypeTest(unittest.TestCase):
         )
 
 
+class SendAlbumWithThumbsTest(unittest.TestCase):
+    """Regression: ``_send_album_with_thumbs`` must use ``peer=`` (not
+    ``entity=``) when constructing ``SendMultiMediaRequest``. Telethon's
+    TL schema for that request exposes the field as ``peer``; using
+    ``entity`` raised::
+
+        TypeError: SendMultiMediaRequest.__init__() got an unexpected
+        keyword argument 'entity'
+
+    and the entire album upload failed. The retry loop then re-fetched the
+    same media repeatedly, which is what the user reported as an "infinite
+    loop" on the same message IDs.
+    """
+
+    def _run(self, coro):
+        import asyncio
+
+        return asyncio.run(coro)
+
+    def test_send_multi_media_request_uses_peer_kwarg(self):
+        from tgcf.utils import _send_album_with_thumbs
+
+        captured = {}
+
+        class _StubClient:
+            def __init__(self):
+                self._file_to_media_calls = []
+
+            async def get_input_entity(self, entity):
+                return f"input_peer({entity})"
+
+            async def _file_to_media(self, file, **kwargs):
+                # Return a fake uploaded-document media so the helper
+                # thinks the upload worked.
+                from telethon import types
+
+                self._file_to_media_calls.append((file, kwargs.get("thumb")))
+                fh = types.InputFile(id=1, parts=1, name="x", md5_checksum="")
+                return (
+                    fh,
+                    types.InputMediaUploadedDocument(
+                        file=fh,
+                        mime_type="video/mp4",
+                        attributes=None,
+                        thumb=None,
+                    ),
+                    False,
+                )
+
+            async def __call__(self, request):
+                from telethon.tl import types
+
+                captured["request_class"] = type(request).__name__
+                captured["request_kwargs"] = {
+                    k: v
+                    for k, v in request.__dict__.items()
+                    if not k.startswith("_")
+                }
+                # ``_send_album_with_thumbs`` expects the result of
+                # UploadMediaRequest, which has ``photo`` and ``document``
+                # attributes. The document branch is what we exercise.
+                from telethon.tl.types import Document
+
+                fake_doc = Document(
+                    id=1,
+                    access_hash=0,
+                    file_reference=b"",
+                    date=0,
+                    mime_type="video/mp4",
+                    size=0,
+                    dc_id=0,
+                    attributes=[],
+                )
+                return type(
+                    "R",
+                    (),
+                    {
+                        "photo": None,
+                        "document": fake_doc,
+                        "updates": [],
+                        "other_updates": [],
+                    },
+                )()
+
+            def _get_response_message(self, random_ids, result, entity):
+                return []
+
+        client = _StubClient()
+
+        self._run(
+            _send_album_with_thumbs(
+                client,
+                entity=12345,
+                files=["a.jpg", "b.mp4"],
+                thumbs=[None, None],
+                captions=["c1", "c2"],
+            )
+        )
+
+        self.assertEqual(captured["request_class"], "SendMultiMediaRequest")
+        # The "entity" field must have been passed as "peer" — the only
+        # accepted name in Telethon's TL schema.
+        self.assertIn("peer", captured["request_kwargs"])
+        self.assertNotIn("entity", captured["request_kwargs"])
+        self.assertEqual(captured["request_kwargs"]["peer"], "input_peer(12345)")
+
+    def test_send_album_with_thumbs_threads_thumb_into_file_to_media(self):
+        """Each per-file thumb path must reach ``_file_to_media`` so
+        ``InputMediaUploadedDocument.thumb`` gets set correctly."""
+        from tgcf.utils import _send_album_with_thumbs
+
+        seen_thumbs = []
+
+        class _StubClient:
+            async def get_input_entity(self, entity):
+                return f"input_peer({entity})"
+
+            async def _file_to_media(self, file, **kwargs):
+                seen_thumbs.append(kwargs.get("thumb"))
+                from telethon import types
+
+                fh = types.InputFile(id=1, parts=1, name="x", md5_checksum="")
+                return (
+                    fh,
+                    types.InputMediaUploadedDocument(
+                        file=fh,
+                        mime_type="video/mp4",
+                        attributes=None,
+                        thumb=None,
+                    ),
+                    False,
+                )
+
+            async def __call__(self, request):
+                from telethon.tl.types import Document
+
+                fake_doc = Document(
+                    id=1,
+                    access_hash=0,
+                    file_reference=b"",
+                    date=0,
+                    mime_type="video/mp4",
+                    size=0,
+                    dc_id=0,
+                    attributes=[],
+                )
+                return type(
+                    "R",
+                    (),
+                    {
+                        "photo": None,
+                        "document": fake_doc,
+                        "updates": [],
+                        "other_updates": [],
+                    },
+                )()
+
+            def _get_response_message(self, random_ids, result, entity):
+                return []
+
+        self._run(
+            _send_album_with_thumbs(
+                _StubClient(),
+                entity=999,
+                files=["a.mp4"],
+                thumbs=["/tmp/thumb_a.jpg"],
+                captions=["cap"],
+            )
+        )
+
+        self.assertEqual(seen_thumbs, ["/tmp/thumb_a.jpg"])
+
+
 if __name__ == "__main__":
     unittest.main()

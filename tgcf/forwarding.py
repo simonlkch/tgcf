@@ -1109,8 +1109,31 @@ async def send_batch(
 
         file_paths = []
         captions = []
+        thumb_paths: List[Optional[str]] = []
+        has_any_thumb = False
         for tm in transformed:
             captions.append(tm.text)
+            # Resolve a thumbnail for items that need one (videos inside an
+            # album, otherwise Telegram uploads the video without a thumb and
+            # the destination sees a blank tile). We pass the path straight
+            # to _send_file_fast_compatible which routes albums through a
+            # helper that respects per-file thumbs.
+            thumb_path: Optional[str] = None
+            if tm.file_type in (FileType.VIDEO, FileType.VIDEO_NOTE, FileType.GIF):
+                ensure_thumb = getattr(tm, "ensure_thumb_file", None)
+                if callable(ensure_thumb):
+                    try:
+                        thumb_path = await ensure_thumb()
+                    except Exception:
+                        logging.exception(
+                            "ensure_thumb_file failed for msg=%s; sending without thumb",
+                            getattr(tm.message, "id", None),
+                        )
+                        thumb_path = None
+                if thumb_path:
+                    _remember_temp_upload_file(thumb_path)
+                    has_any_thumb = True
+            thumb_paths.append(thumb_path)
             if tm.new_file:
                 _remember_temp_upload_file(tm.new_file)
                 file_paths.append(tm.new_file)
@@ -1123,9 +1146,10 @@ async def send_batch(
             break
         else:
             logging.info(
-                "send_batch album upload path: recipient=%s file_count=%s",
+                "send_batch album upload path: recipient=%s file_count=%s has_thumb=%s",
                 recipient,
                 len(file_paths),
+                has_any_thumb,
             )
             uploaded = await _send_file_fast_compatible(
                 upload_client,
@@ -1139,6 +1163,10 @@ async def send_batch(
                 # Using only the first file's type caused videos inside
                 # mixed albums to arrive as non-streaming documents.
                 source_media_type=[tm.file_type for tm in transformed],
+                # Per-file thumbnail paths. Items without a thumbnail pass
+                # ``None``; items with one route through our album helper so
+                # Telethon's _send_album (which drops thumb) is bypassed.
+                album_thumbs=thumb_paths if has_any_thumb else None,
             )
             if isinstance(uploaded, list):
                 return uploaded
